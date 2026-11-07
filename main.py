@@ -185,6 +185,25 @@ def should_skip(item: dict[str, Any]) -> bool:
     return not slug or bool(SKIP_RE.search(title) or SKIP_RE.search(slug))
 
 
+def has_download_links(detail: dict[str, Any]) -> bool:
+    """Return True when the detail record exposes at least one usable link."""
+    link_fields = (detail.get("downloadMirrors"), detail.get("torrents"))
+
+    def walk(value: Any) -> Iterable[str]:
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                yield candidate
+        elif isinstance(value, list):
+            for item in value:
+                yield from walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from walk(item)
+
+    return any(re.match(r"^(?:https?://|magnet:\?)", value, re.IGNORECASE) for field in link_fields for value in walk(field))
+
+
 def description(detail: dict[str, Any]) -> str:
     paragraphs = unique_strings(detail.get("gameDescription"))
     features = unique_strings(detail.get("repackFeatures"))
@@ -222,6 +241,7 @@ def map_game(summary: dict[str, Any], detail: dict[str, Any], existing: dict[str
         "system_requirements": "Not Found",
         "repacker": "Fitgirl",
         "download_url": f"{download_base.rstrip('/')}/fg-{urllib.parse.quote(slug, safe='-')}",
+        "is_published": True,
         "featured": bool((existing or {}).get("featured", False)),
         "downloads_count": int((existing or {}).get("downloads_count", 0) or 0),
         "created_at": (existing or {}).get("created_at") or datetime.now(timezone.utc).isoformat(),
@@ -313,6 +333,10 @@ def run_cycle(args: argparse.Namespace) -> int:
                 continue
             detail = get_with_retries(f"{fitgirl_base}/repack/{urllib.parse.quote(slug, safe='-')}")
             if not isinstance(detail, dict) or should_skip(detail):
+                continue
+            if not has_download_links(detail):
+                print(f"skip without download links: {slug}")
+                seen.add(slug)
                 continue
             game = map_game(summary, detail, by_slug.get(slug), download_base)
             imported.append(game)
