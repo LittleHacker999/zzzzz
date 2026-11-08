@@ -9,13 +9,13 @@ Required environment variables for a real write:
   GITHUB_CONTENTS_TOKEN   Fine-grained token with Contents: Read and write
 
 Optional environment variables:
-  GITHUB_REPO_OWNER       Default: ItzJithula
-  GITHUB_REPO_NAME        Default: Repack-X
+  GITHUB_REPO_OWNER       Default: LittleHacker999
+  GITHUB_REPO_NAME        Default: musical-guacamole
   GITHUB_REPO_BRANCH      Default: main
   GITHUB_DATA_PATH        Default: data/games.json
   FITGIRL_API_BASE_URL    Default: https://fitgirl-api-5rbz.onrender.com
   REPACK_X_DOWNLOAD_BASE  Default: https://repack-x-database.vercel.app
-  FITGIRL_IMPORT_PAGES    Default: 1
+  FITGIRL_IMPORT_PAGES    Maximum latest pages to scan per cycle. Default: 10
   FITGIRL_IMPORT_LIMIT    Default: 1
   FITGIRL_IMPORT_DELAY     Default: 0.25 seconds
   FITGIRL_IMPORT_INTERVAL  Default: 3600 seconds (1 hour)
@@ -228,13 +228,17 @@ def map_game(summary: dict[str, Any], detail: dict[str, Any], existing: dict[str
         *as_list(detail.get("tags")),
         detail.get("category"),
     ])
+    categories = [category for category in categories if category.casefold() != "lossless repack"]
+    repack_size = text(detail.get("repackSize")) or "Not Found"
+    if re.search(r"\[selective download\]", repack_size, re.IGNORECASE):
+        repack_size = "Not Found"
     return {
         "id": (existing or {}).get("id") or deterministic_id(slug),
         "title": text(detail.get("title") or summary.get("title")),
         "slug": slug,
         "categories": categories,
         "size_original": text(detail.get("originalSize")) or "Not Found",
-        "size_repack": text(detail.get("repackSize")) or "Not Found",
+        "size_repack": repack_size,
         "description": description(detail),
         "cover_url": text(detail.get("cover")) or None,
         "screenshots": image_urls(detail.get("screenshots")),
@@ -279,7 +283,7 @@ def write_catalogue(owner: str, repo: str, branch: str, path: str, token: str, g
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--pages", type=int, default=env_int("FITGIRL_IMPORT_PAGES", 1), help="Override FITGIRL_IMPORT_PAGES.")
+    parser.add_argument("--pages", type=int, default=env_int("FITGIRL_IMPORT_PAGES", 10), help="Override FITGIRL_IMPORT_PAGES.")
     parser.add_argument("--limit", type=int, default=env_int("FITGIRL_IMPORT_LIMIT", 1), help="Override FITGIRL_IMPORT_LIMIT. Continuous mode always imports one.")
     parser.add_argument("--delay", type=float, default=env_float("FITGIRL_IMPORT_DELAY", 0.25), help="Override FITGIRL_IMPORT_DELAY.")
     parser.add_argument("--interval", type=float, default=env_float("FITGIRL_IMPORT_INTERVAL", 3600), help="Override FITGIRL_IMPORT_INTERVAL in seconds.")
@@ -292,8 +296,8 @@ def parse_args() -> argparse.Namespace:
 def run_cycle(args: argparse.Namespace) -> int:
     fitgirl_base = env("FITGIRL_API_BASE_URL", DEFAULT_FITGIRL_API).rstrip("/")
     download_base = env("REPACK_X_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE)
-    owner = env("GITHUB_REPO_OWNER", "ItzJithula")
-    repo = env("GITHUB_REPO_NAME", "Repack-X")
+    owner = env("GITHUB_REPO_OWNER", "LittleHacker999")
+    repo = env("GITHUB_REPO_NAME", "musical-guacamole")
     branch = env("GITHUB_REPO_BRANCH", "main")
     path = env("GITHUB_DATA_PATH", "data/games.json")
     token = os.environ.get("GITHUB_CONTENTS_TOKEN", "").strip()
@@ -315,7 +319,10 @@ def run_cycle(args: argparse.Namespace) -> int:
     # per cycle. --limit remains useful for a dry-run or an explicit --once.
     cycle_limit = args.limit if (args.dry_run or args.once) else 1
 
-    for page in range(1, args.pages + 1):
+    # Always allow a page-two fallback. This protects deployments that still
+    # have FITGIRL_IMPORT_PAGES=1 from getting stuck on a completed page one.
+    page_limit = max(args.pages, 2)
+    for page in range(1, page_limit + 1):
         latest = get_with_retries(f"{fitgirl_base}/latest?page={page}")
         results = latest.get("results", []) if isinstance(latest, dict) else latest
         if not isinstance(results, list):
