@@ -22,6 +22,8 @@ Optional environment variables:
   FITGIRL_IMPORT_ONCE      Default: false
   FITGIRL_IMPORT_DRY_RUN   Default: false
   FITGIRL_IMPORT_FORCE     Default: false
+  FITGIRL_FETCH_GOG        Default: true; enrich cover, genres, screenshots and system requirements
+  GOG_IMPORT_DELAY         Default: 0.25 seconds between GOG requests
 
 Continuous mode imports at most one new release, then waits one hour before
 checking again. It runs until interrupted with Ctrl+C.
@@ -50,6 +52,7 @@ from typing import Any, Iterable
 
 DEFAULT_FITGIRL_API = "https://fitgirl-api-5rbz.onrender.com"
 DEFAULT_DOWNLOAD_BASE = "https://repack-x-database.vercel.app"
+DEFAULT_GOG_DELAY = 0.25
 IMAGE_URL_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)(?:[?#].*)?$", re.IGNORECASE)
 SKIP_RE = re.compile(r"(?:upcoming[- ]repacks?|updates?[- ]digest|digest[- ]updates?)", re.IGNORECASE)
 
@@ -179,6 +182,94 @@ def clean_slug(value: Any) -> str:
     return re.sub(r"[^a-z0-9-]", "", text(value).lower())
 
 
+def clean_title_for_gog(title: str) -> str:
+    """Remove FitGirl/build/DLC noise so GOG search receives the game title."""
+    value = re.sub(r"\[.*?\]", " ", title or "")
+    value = re.sub(r"\((?:[^)]*(?:repack|build|dlc|patch|update|v\s*\d|fitgirl|dodi)[^)]*)\)", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(?:fitgirl|dodi|elamigos|mr\s*dj|xatab|codex|skidrow|reloaded|plaza|empress)\b.*$", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\+\s*(?:\d+|all)?\s*dlcs?\b.*$", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(?:v|ver\.?|version|build|patch)\s*[\d._-]+[a-z]?\b.*$", " ", value, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", re.sub(r"[:\-–—/]", " ", value)).strip()
+
+
+def title_relevance_score(search_title: str, product_title: str) -> float:
+    stop_words = {"the", "and", "for", "with", "all", "edition", "bundle"}
+    search_words = [re.sub(r"[^a-z0-9]", "", word) for word in search_title.lower().split()]
+    product_words = [re.sub(r"[^a-z0-9]", "", word) for word in product_title.lower().split()]
+    search_words = [word for word in search_words if len(word) > 2 and word not in stop_words]
+    product_words = [word for word in product_words if len(word) > 2 and word not in stop_words]
+    if not search_words:
+        return 1.0
+    return sum(any(product_word in search_word or search_word in product_word for product_word in product_words) for search_word in search_words) / len(search_words)
+
+
+def gog_system_requirements(os_list: Any) -> str:
+    if not isinstance(os_list, list) or not os_list:
+        return ""
+    windows = next((item for item in os_list if str(item.get("operatingSystem", {}).get("name", "")).lower() == "windows"), os_list[0])
+    groups = windows.get("systemRequirements") if isinstance(windows, dict) else None
+    if not isinstance(groups, list):
+        return ""
+    sections = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        lines = []
+        for requirement in group.get("requirements", []):
+            if not isinstance(requirement, dict):
+                continue
+            name = str(requirement.get("name") or requirement.get("id") or "").rstrip(":").strip()
+            desc = str(requirement.get("description") or "").strip()
+            if name and desc:
+                lines.append(f"{name}: {desc}")
+            elif desc:
+                lines.append(desc)
+        if group.get("description"):
+            lines.append(str(group["description"]).strip())
+        if lines:
+            sections.append(f"{str(group.get('type') or 'Requirement').upper()}:\n" + "\n".join(lines))
+    return "\n\n".join(sections).strip()
+
+
+def fetch_gog_metadata(title: str, delay: float = DEFAULT_GOG_DELAY) -> dict[str, Any]:
+    """Fetch optional GOG metadata, returning an empty result on a safe miss."""
+    query = clean_title_for_gog(title)
+    if not query:
+        return {}
+    try:
+        catalog = get_with_retries(f"https://catalog.gog.com/v1/catalog?query={urllib.parse.quote(query)}&limit=10")
+        products = catalog.get("products", []) if isinstance(catalog, dict) else []
+        products = [product for product in products if isinstance(product, dict) and title_relevance_score(query, text(product.get("title"))) >= 0.25]
+        if not products:
+            return {}
+        product = next((item for item in products if text(item.get("title")).casefold() == query.casefold()), products[0])
+        product_id = product.get("id")
+        if not product_id:
+            return {}
+        time.sleep(max(0, delay))
+        detail = get_with_retries(f"https://api.gog.com/v2/games/{urllib.parse.quote(str(product_id), safe='')}")
+        screenshots = image_urls([clean_gog_url(url) for url in as_list(product.get("screenshots"))])
+        genres = unique_strings([
+            *(item.get("name") if isinstance(item, dict) else item for item in as_list(product.get("genres"))),
+            *(item.get("name") if isinstance(item, dict) else item for item in as_list(product.get("tags"))),
+        ])
+        return {
+            "cover_url": clean_gog_url(product.get("coverVertical") or product.get("image")),
+            "screenshots": screenshots,
+            "genres": [genre for genre in genres if genre.casefold() != "lossless repack"],
+            "system_requirements": gog_system_requirements(detail.get("_embedded", {}).get("supportedOperatingSystems")),
+        }
+    except Exception as error:
+        print(f"skip GOG enrichment for {title}: {error}")
+        return {}
+
+
+def clean_gog_url(value: Any) -> str:
+    url = text(value)
+    url = re.sub(r"_{formatter}", "", url)
+    return "https://" + url[7:] if url.startswith("http://") else url
+
+
 def should_skip(item: dict[str, Any]) -> bool:
     title = text(item.get("title"))
     slug = text(item.get("slug"))
@@ -205,8 +296,8 @@ def has_download_links(detail: dict[str, Any]) -> bool:
 
 
 def description(detail: dict[str, Any]) -> str:
-    paragraphs = unique_strings(detail.get("gameDescription"))
-    features = unique_strings(detail.get("repackFeatures"))
+    paragraphs = unique_strings(as_list(detail.get("gameDescription")))
+    features = unique_strings(as_list(detail.get("repackFeatures")))
     sections: list[str] = []
     if paragraphs:
         sections.append("\n\n".join(paragraphs))
@@ -221,7 +312,7 @@ def deterministic_id(slug: str) -> str:
     return f"{digest[:8]}-{digest[8:12]}-5{digest[13:16]}-{digest[16:20]}-{digest[20:32]}"
 
 
-def map_game(summary: dict[str, Any], detail: dict[str, Any], existing: dict[str, Any] | None, download_base: str) -> dict[str, Any]:
+def map_game(summary: dict[str, Any], detail: dict[str, Any], existing: dict[str, Any] | None, download_base: str, gog: dict[str, Any] | None = None) -> dict[str, Any]:
     slug = clean_slug(detail.get("slug") or summary.get("slug"))
     categories = unique_strings([
         *as_list(detail.get("genres")),
@@ -229,6 +320,7 @@ def map_game(summary: dict[str, Any], detail: dict[str, Any], existing: dict[str
         detail.get("category"),
     ])
     categories = [category for category in categories if category.casefold() != "lossless repack"]
+    categories = unique_strings([*categories, *((gog or {}).get("genres") or [])])
     repack_size = text(detail.get("repackSize")) or "Not Found"
     if re.search(r"\[selective download\]", repack_size, re.IGNORECASE):
         repack_size = "Not Found"
@@ -240,9 +332,9 @@ def map_game(summary: dict[str, Any], detail: dict[str, Any], existing: dict[str
         "size_original": text(detail.get("originalSize")) or "Not Found",
         "size_repack": repack_size,
         "description": description(detail),
-        "cover_url": text(detail.get("cover")) or None,
-        "screenshots": image_urls(detail.get("screenshots")),
-        "system_requirements": "Not Found",
+        "cover_url": text(detail.get("cover")) or (gog or {}).get("cover_url") or None,
+        "screenshots": unique_strings([*image_urls(detail.get("screenshots")), *((gog or {}).get("screenshots") or [])]),
+        "system_requirements": (gog or {}).get("system_requirements") or "Not Found",
         "repacker": "Fitgirl",
         "download_url": f"{download_base.rstrip('/')}/fg-{urllib.parse.quote(slug, safe='-')}",
         "is_published": True,
@@ -301,6 +393,8 @@ def run_cycle(args: argparse.Namespace) -> int:
     branch = env("GITHUB_REPO_BRANCH", "main")
     path = env("GITHUB_DATA_PATH", "data/games.json")
     token = os.environ.get("GITHUB_CONTENTS_TOKEN", "").strip()
+    fetch_gog = env_bool("FITGIRL_FETCH_GOG", True)
+    gog_delay = env_float("GOG_IMPORT_DELAY", DEFAULT_GOG_DELAY)
 
     existing: list[dict[str, Any]] = []
     sha: str | None = None
@@ -345,7 +439,8 @@ def run_cycle(args: argparse.Namespace) -> int:
                 print(f"skip without download links: {slug}")
                 seen.add(slug)
                 continue
-            game = map_game(summary, detail, by_slug.get(slug), download_base)
+            gog = fetch_gog_metadata(text(detail.get("title") or summary.get("title")), gog_delay) if fetch_gog else {}
+            game = map_game(summary, detail, by_slug.get(slug), download_base, gog)
             imported.append(game)
             by_slug[slug] = game
             seen.add(slug)
