@@ -322,8 +322,7 @@ def map_game(summary: dict[str, Any], detail: dict[str, Any], existing: dict[str
     categories = [category for category in categories if category.casefold() != "lossless repack"]
     categories = unique_strings([*categories, *((gog or {}).get("genres") or [])])
     repack_size = text(detail.get("repackSize")) or "Not Found"
-    if re.search(r"\[selective download\]", repack_size, re.IGNORECASE):
-        repack_size = "Not Found"
+    repack_size = re.sub(r"\s*\[selective download\]\s*$", "", repack_size, flags=re.IGNORECASE).strip() or "Not Found"
     return {
         "id": (existing or {}).get("id") or deterministic_id(slug),
         "title": text(detail.get("title") or summary.get("title")),
