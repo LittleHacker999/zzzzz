@@ -239,13 +239,33 @@ def parse_json_bytes(raw: bytes, path: str) -> list[dict[str, Any]]:
     return [game for game in games if isinstance(game, dict)]
 
 
-def clone_repository(owner: str, repo: str, branch: str) -> Path:
+def clone_repository(owner: str, repo: str, branch: str, token: str = "", data_path: str = "data/games.json") -> Path:
     root = Path(tempfile.mkdtemp(prefix="repackx-fitgirl-"))
     destination = root / "repo"
     url = f"https://github.com/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}.git"
     command = ["git", "clone", "--depth", "1", "--branch", branch, url, str(destination)]
     try:
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=180)
+        return destination
+    except FileNotFoundError:
+        # Render and other minimal containers may not include git. Build the
+        # small catalogue snapshot needed by this worker through GitHub's
+        # Contents API instead of requiring a system package.
+        data_dir = destination / Path(data_path).parent
+        data_dir.mkdir(parents=True, exist_ok=True)
+        listing_url = github_file_url(owner, repo, str(Path(data_path).parent)) + "?ref=" + urllib.parse.quote(branch)
+        payload, _ = api_json(listing_url, token=token)
+        if not isinstance(payload, list):
+            shutil.rmtree(root, ignore_errors=True)
+            raise RuntimeError("GitHub data directory listing was not an array.")
+        for item in payload:
+            name = str(item.get("name") or "")
+            if not GAMES_RE.fullmatch(name):
+                continue
+            raw, _ = api_json(str(item.get("url")), token=token)
+            content = base64.b64decode(str(raw.get("content", "")).replace("\n", ""))
+            (data_dir / name).write_bytes(content)
+        return destination
     except Exception:
         shutil.rmtree(root, ignore_errors=True)
         raise
@@ -380,7 +400,7 @@ def run_cycle(args: argparse.Namespace) -> int:
     if not args.dry_run and not token:
         raise RuntimeError("GITHUB_CONTENTS_TOKEN is required unless --dry-run is used.")
 
-    clone_root = clone_repository(owner, repo, branch)
+    clone_root = clone_repository(owner, repo, branch, token, data_path)
     try:
         files = discover_game_files(clone_root, data_path)
         state = read_state(state_file)
