@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """Import FitGirl latest releases into the Repack X GitHub JSON catalogue.
 
-Uses git clone/pull/push instead of GitHub API (avoids abuse detection).
-
-Every cycle:
-  1. git pull the repo (gets gamesN.json files)
-  2. Read all games*.json from local disk
-  3. Fetch /latest?page=1 from FitGirl API
-  4. Import any new games
-  5. Write gamesN.json files locally
-  6. git commit + push
+At startup AND every cycle, the code:
+  1. Asks GitHub "how many gamesN.json files exist in data/?" (auto-discovery)
+  2. Reads ALL discovered files and merges all games
+  3. Checks FitGirl /latest?page=1 for new games
+  4. Writes games1.json, games2.json, ... back (auto-split at 850 KB)
 
 Health-check endpoints:
   GET /             → HTML status page
   GET /api/health   → {"working": true}
   GET /api/status   → detailed JSON
 
-Required environment variables:
-  GITHUB_REPO_URL         Full repo URL, e.g. https://github.com/owner/repo.git
-  GITHUB_CONTENTS_TOKEN   Fine-grained token (used in git URL for auth)
+Required:
+  GITHUB_CONTENTS_TOKEN   Fine-grained token with Contents: Read and write
 
 Optional:
+  GITHUB_REPO_OWNER       Default: LittleHacker999
+  GITHUB_REPO_NAME        Default: musical-guacamole
+  GITHUB_REPO_BRANCH      Default: main
   GITHUB_DATA_DIR         Default: data
   FITGIRL_API_BASE_URL    Default: https://fitgirl-api-5rbz.onrender.com
   REPACK_X_DOWNLOAD_BASE  Default: https://repack-x-database.vercel.app
@@ -34,7 +32,6 @@ Optional:
   GOG_IMPORT_DELAY         Default: 0.25
   HEALTH_PORT              Default: 8080
   HEALTH_HOST              Default: 0.0.0.0
-  LOCAL_REPO_PATH          Default: /tmp/repack-x-repo
 
 Examples:
   python scripts/import_fitgirl_latest.py --dry-run
@@ -45,18 +42,17 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any, Iterable
@@ -67,17 +63,10 @@ DEFAULT_GOG_DELAY = 0.25
 DEFAULT_HEALTH_PORT = 8080
 DEFAULT_HEALTH_HOST = "0.0.0.0"
 DEFAULT_DATA_DIR = "data"
-DEFAULT_LOCAL_REPO = "/tmp/repack-x-repo"
-
 CHUNK_MAX_BYTES = 850_000
 
-IMAGE_URL_RE = re.compile(
-    r"\.(?:jpe?g|png|webp|gif|avif)(?:[?#].*)?$", re.IGNORECASE
-)
-SKIP_RE = re.compile(
-    r"(?:upcoming[- ]repacks?|updates?[- ]digest|digest[- ]updates?)",
-    re.IGNORECASE,
-)
+IMAGE_URL_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)(?:[?#].*)?$", re.IGNORECASE)
+SKIP_RE = re.compile(r"(?:upcoming[- ]repacks?|updates?[- ]digest|digest[- ]updates?)", re.IGNORECASE)
 GAMES_FILE_RE = re.compile(r"^games(\d*)\.json$", re.IGNORECASE)
 
 
@@ -173,12 +162,10 @@ display:flex;justify-content:center;align-items:center;min-height:100vh}}
 padding:40px 48px;max-width:580px;width:90%}}
 h1{{color:#58a6ff;font-size:1.6rem;margin-bottom:6px}}
 .sub{{color:#8b949e;margin-bottom:28px;font-size:.95rem}}
-.row{{display:flex;justify-content:space-between;padding:10px 0;
-border-bottom:1px solid #21262d}}
+.row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #21262d}}
 .row:last-child{{border-bottom:none}}
 .lab{{color:#8b949e;font-size:.88rem}}
-.val{{color:#c9d1d9;font-size:.88rem;font-weight:600;
-text-align:right;max-width:300px;word-break:break-word}}
+.val{{color:#c9d1d9;font-size:.88rem;font-weight:600;text-align:right;max-width:300px;word-break:break-word}}
 .badge{{padding:3px 10px;border-radius:20px;font-size:.82rem;font-weight:600}}
 .badge.ok{{background:#1a3c2a;color:#3fb950}}
 .badge.error{{background:#3c1a1a;color:#f85149}}
@@ -193,7 +180,7 @@ border-radius:50%;margin-right:6px;animation:p 1.5s ease-in-out infinite}}
 <div class="row"><span class="lab">Status</span><span class="val"><span class="badge ok">Working</span></span></div>
 <div class="row"><span class="lab">Started</span><span class="val">{s["started_at"]}</span></div>
 <div class="row"><span class="lab">Last cycle</span><span class="val">{s["last_cycle_at"] or "Not yet"}</span></div>
-<div class="row"><span class="lab">Last result</span><span class="val">{s["last_cycle_result"] or "—"}</span></div>
+<div class="row"><span class="lab">Last result</span><span class="val">{s["last_cycle_result"] or "\u2014"}</span></div>
 <div class="row"><span class="lab">Total imported</span><span class="val">{s["total_imported"]}</span></div>
 <div class="row"><span class="lab">Total games</span><span class="val">{s["total_games"]}</span></div>
 <div class="row"><span class="lab">Game files</span><span class="val">{files}</span></div>
@@ -253,124 +240,191 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  GIT HELPERS (replaces GitHub API)
+#  HTTP LAYER
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def run_git(args: list[str], cwd: str, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-    )
-    if check and result.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
-    return result
+def fetch_json(url: str, headers: dict[str, str] | None = None, timeout: int = 90) -> Any:
+    hdr = {"Accept": "application/json", "User-Agent": "Repack-X-Importer/1.0"}
+    if headers:
+        hdr.update(headers)
+    req = urllib.request.Request(url, headers=hdr)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        d = e.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"HTTP {e.code} from {url}: {d}") from e
 
 
-def get_auth_url(repo_url: str) -> str:
-    """Embed the token in the URL for authentication."""
+def get_with_retries(url: str, retries: int = 3) -> Any:
+    last: Exception | None = None
+    for i in range(retries):
+        try:
+            return fetch_json(url)
+        except Exception as e:
+            last = e
+            if i + 1 < retries:
+                time.sleep(2**i)
+    raise RuntimeError(f"Could not fetch {url}: {last}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GITHUB API HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def gh_headers() -> dict[str, str]:
     token = os.environ.get("GITHUB_CONTENTS_TOKEN", "").strip()
-    if not token:
-        return repo_url
-    # https://github.com/owner/repo.git → https://TOKEN@github.com/owner/repo.git
-    if repo_url.startswith("https://"):
-        return f"https://{token}@{repo_url[8:]}"
-    return repo_url
+    h = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Repack-X-Importer/1.0",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
 
 
-def clone_or_pull(repo_url: str, local_path: str, branch: str) -> None:
-    """Clone the repo if not present, or pull the latest changes."""
-    auth_url = get_auth_url(repo_url)
-
-    if os.path.isdir(os.path.join(local_path, ".git")):
-        # Already cloned → fetch + reset + pull
-        print(f"[git] pulling {local_path} ...")
-        run_git(["fetch", "origin"], local_path)
-        run_git(["checkout", branch], local_path, check=False)
-        run_git(["reset", "--hard", f"origin/{branch}"], local_path)
-        print("[git] pull done.")
-    else:
-        print(f"[git] cloning {repo_url} ...")
-        if os.path.exists(local_path):
-            shutil.rmtree(local_path)
-        run_git(["clone", "--branch", branch, "--depth", "1", auth_url, local_path], "/")
-        print("[git] clone done.")
+def gh_url(owner: str, repo: str, path: str) -> str:
+    parts = "/".join(urllib.parse.quote(p, safe="") for p in path.strip("/").split("/"))
+    return f"https://api.github.com/repos/{owner}/{repo}/contents/{parts}"
 
 
-def commit_and_push(local_path: str, branch: str, message: str) -> bool:
-    """Stage all changes, commit, and push. Returns True if pushed."""
-    run_git(["add", "-A"], local_path)
-
-    # Check if there are changes to commit
-    status = run_git(["status", "--porcelain"], local_path, check=False)
-    if not status.stdout.strip():
-        print("[git] no changes to commit.")
-        return False
-
-    run_git(["config", "user.name", "FitGirl Importer"], local_path, check=False)
-    run_git(["config", "user.email", "importer@repack-x.dev"], local_path, check=False)
-    run_git(["commit", "-m", message], local_path)
-
-    print(f"[git] pushing to {branch} ...")
-    run_git(["push", "origin", branch], local_path)
-    print("[git] push done.")
-    return True
+def gh_request(url: str, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
+    body = json.dumps(payload).encode() if payload else None
+    hdr = gh_headers()
+    if body:
+        hdr["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=hdr, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        d = e.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"HTTP {e.code} from {url}: {d}") from e
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DISCOVER & READ gamesN.json (from local disk)
+#  ★ FILE DISCOVERY: Find all gamesN.json in data/ folder ★
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def discover_games_files(local_repo: str, data_dir: str) -> list[str]:
-    """Find games*.json files on local disk, sorted by number."""
-    dir_path = os.path.join(local_repo, data_dir)
-    if not os.path.isdir(dir_path):
+def discover_games_files(
+    owner: str, repo: str, branch: str, data_dir: str
+) -> list[dict[str, Any]]:
+    """
+    ★ Asks GitHub: "How many gamesN.json files exist in {data_dir}/?" ★
+
+    Single API call:
+      GET /repos/{owner}/{repo}/contents/{data_dir}?ref={branch}
+
+    Scans every item, matches games*.json pattern, returns sorted by number.
+
+    Returns:
+      [
+        {"name": "games1.json", "path": "data/games1.json", "sha": "abc", "number": 1},
+        {"name": "games2.json", "path": "data/games2.json", "sha": "def", "number": 2},
+        {"name": "games3.json", "path": "data/games3.json", "sha": "ghi", "number": 3},
+      ]
+    """
+    url = gh_url(owner, repo, data_dir) + "?ref=" + urllib.parse.quote(branch)
+
+    print(f"[discovery] Asking GitHub: what files exist in '{data_dir}/'?")
+    print(f"[discovery] GET {url}")
+
+    payload = gh_request(url)
+
+    if not isinstance(payload, list):
+        print(f"[discovery] WARNING: expected a list, got {type(payload).__name__}")
         return []
-    found: list[tuple[int, str]] = []
-    for name in os.listdir(dir_path):
-        m = GAMES_FILE_RE.match(name)
-        if m and os.path.isfile(os.path.join(dir_path, name)):
-            num = int(m.group(1)) if m.group(1) else 0
-            found.append((num, name))
-    found.sort(key=lambda x: x[0])
-    return [name for _, name in found]
+
+    print(f"[discovery] GitHub returned {len(payload)} item(s) in '{data_dir}/':")
+    for item in payload:
+        item_type = item.get("type", "?")
+        item_name = item.get("name", "?")
+        marker = "📄" if item_type == "file" else "📁"
+        print(f"[discovery]   {marker} {item_name} ({item_type})")
+
+    # Now filter: only games*.json files
+    found: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict) or item.get("type") != "file":
+            continue
+        name = item.get("name", "")
+        match = GAMES_FILE_RE.match(name)
+        if match:
+            num = int(match.group(1)) if match.group(1) else 0
+            found.append({
+                "name": name,
+                "path": item.get("path", f"{data_dir}/{name}"),
+                "sha": item.get("sha", ""),
+                "number": num,
+            })
+            print(f"[discovery]   ✅ MATCH: {name} (number={num})")
+        else:
+            print(f"[discovery]   ❌ skip: {name} (not games*.json)")
+
+    found.sort(key=lambda x: x["number"])
+
+    print(f"[discovery] ═══════════════════════════════════════")
+    print(f"[discovery] FOUND {len(found)} games file(s):")
+    for f in found:
+        print(f"[discovery]   {f['number']}. {f['name']}  sha={f['sha'][:8]}...")
+    print(f"[discovery] ═══════════════════════════════════════")
+
+    return found
 
 
-def read_catalogue(local_repo: str, data_dir: str) -> list[dict[str, Any]]:
-    """Read all gamesN.json files and return merged list of games."""
-    files = discover_games_files(local_repo, data_dir)
-    print(f"[read] found {len(files)} file(s): {files}")
+# ═══════════════════════════════════════════════════════════════════════════
+#  READ ALL gamesN.json
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def read_catalogue(
+    owner: str, repo: str, branch: str, data_dir: str
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    files = discover_games_files(owner, repo, branch, data_dir)
 
     games: list[dict[str, Any]] = []
-    for name in files:
-        path = os.path.join(local_repo, data_dir, name)
+    file_info: dict[str, dict[str, Any]] = {}
+
+    for fi in files:
+        url = gh_url(owner, repo, fi["path"]) + "?ref=" + urllib.parse.quote(branch)
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                parsed = json.load(f)
+            payload = gh_request(url)
+        except RuntimeError as e:
+            if "404" in str(e):
+                print(f"[read]   {fi['name']}: 404, skipping")
+                continue
+            raise
+
+        file_info[fi["path"]] = {"sha": payload.get("sha", fi.get("sha", "")), "name": fi["name"]}
+
+        try:
+            content = base64.b64decode(
+                str(payload.get("content", "")).replace("\n", "")
+            ).decode("utf-8")
+            parsed = json.loads(content)
         except Exception:
-            print(f"[read]   {name}: invalid JSON, skipping")
+            print(f"[read]   {fi['name']}: invalid JSON, skipping")
             continue
 
         if isinstance(parsed, list):
             games.extend(parsed)
-            print(f"[read]   {name}: {len(parsed)} game(s)")
+            print(f"[read]   {fi['name']}: loaded {len(parsed)} game(s)")
         elif isinstance(parsed, dict) and isinstance(parsed.get("games"), list):
             games.extend(parsed["games"])
-            print(f"[read]   {name}: {len(parsed['games'])} game(s)")
+            print(f"[read]   {fi['name']}: loaded {len(parsed['games'])} game(s)")
         else:
-            print(f"[read]   {name}: unknown format, skipping")
+            print(f"[read]   {fi['name']}: unknown format, skipping")
 
-    print(f"[read] total: {len(games)} game(s)")
-    return games
+    print(f"[read] TOTAL: {len(games)} game(s) from {len(file_info)} file(s)")
+    return games, file_info
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  WRITE CATALOGUE (to local disk)
+#  WRITE CATALOGUE
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -394,64 +448,45 @@ def _split_chunks(games: list[dict[str, Any]], max_bytes: int) -> list[list[dict
     return chunks or [[]]
 
 
-def write_catalogue(local_repo: str, data_dir: str, games: list[dict[str, Any]]) -> list[str]:
-    """Write games to games1.json, games2.json, ... on local disk."""
-    dir_path = os.path.join(local_repo, data_dir)
-    os.makedirs(dir_path, exist_ok=True)
-
-    # Remove old games*.json files first
-    for name in os.listdir(dir_path):
-        if GAMES_FILE_RE.match(name):
-            os.remove(os.path.join(dir_path, name))
-
+def write_catalogue(
+    owner: str, repo: str, branch: str, data_dir: str,
+    games: list[dict[str, Any]], file_info: dict[str, dict[str, Any]], message: str,
+) -> None:
     chunks = _split_chunks(games, CHUNK_MAX_BYTES)
     total_kb = len(json.dumps(games, ensure_ascii=False, indent=2).encode()) / 1024
-    print(f"[write] {len(games)} game(s) → {len(chunks)} file(s), total {total_kb:.0f} KB")
+    print(f"[write] {len(games)} game(s) -> {len(chunks)} file(s), total {total_kb:.0f} KB")
 
-    written: list[str] = []
+    new_paths: set[str] = set()
     for i, chunk in enumerate(chunks):
         name = f"games{i + 1}.json"
-        path = os.path.join(dir_path, name)
+        path = f"{data_dir}/{name}"
         raw = json.dumps(chunk, ensure_ascii=False, indent=2) + "\n"
         sz = len(raw.encode("utf-8"))
         if sz > 1_000_000:
             raise RuntimeError(f"{name} is {sz / 1024:.0f} KB; exceeds 1 MB")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(raw)
-        written.append(name)
+
+        sha = file_info.get(path, {}).get("sha", "")
+        data = {"message": message, "content": base64.b64encode(raw.encode()).decode("ascii"), "branch": branch}
+        if sha:
+            data["sha"] = sha
+        gh_request(gh_url(owner, repo, path), method="PUT", payload=data)
+        new_paths.add(path)
         print(f"[write]   {name}: {len(chunk)} game(s), {sz / 1024:.0f} KB")
 
-    return written
+    for path, info in file_info.items():
+        if path not in new_paths:
+            sha = info.get("sha")
+            if sha:
+                try:
+                    gh_request(gh_url(owner, repo, path), method="DELETE", payload={
+                        "message": f"Remove orphaned {info.get('name', path)}",
+                        "sha": sha, "branch": branch,
+                    })
+                    print(f"[write]   removed {info.get('name', path)}")
+                except Exception:
+                    pass
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  FITGIRL HTTP LAYER
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def api_json(url: str) -> Any:
-    req = urllib.request.Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": "Repack-X-Importer/1.0"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        d = e.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"HTTP {e.code} from {url}: {d}") from e
-
-
-def get_with_retries(url: str, retries: int = 3) -> Any:
-    last: Exception | None = None
-    for i in range(retries):
-        try:
-            return api_json(url)
-        except Exception as e:
-            last = e
-            if i + 1 < retries:
-                time.sleep(2**i)
-    raise RuntimeError(f"Could not fetch {url}: {last}")
+    print(f"[write] done: {len(new_paths)} file(s)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -704,35 +739,39 @@ def parse_args() -> argparse.Namespace:
 def run_cycle(args: argparse.Namespace) -> int:
     fg_base = env("FITGIRL_API_BASE_URL", DEFAULT_FITGIRL_API).rstrip("/")
     dl_base = env("REPACK_X_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE)
+    owner = env("GITHUB_REPO_OWNER", "LittleHacker999")
+    repo = env("GITHUB_REPO_NAME", "musical-guacamole")
+    branch = env("GITHUB_REPO_BRANCH", "main")
     data_dir = env("GITHUB_DATA_DIR", DEFAULT_DATA_DIR)
-    local_repo = env("LOCAL_REPO_PATH", DEFAULT_LOCAL_REPO)
+    token = os.environ.get("GITHUB_CONTENTS_TOKEN", "").strip()
     fetch_gog = env_bool("FITGIRL_FETCH_GOG", True)
     gog_delay = env_float("GOG_IMPORT_DELAY", DEFAULT_GOG_DELAY)
 
-    # ── 1. Git pull to get latest files ─────────────────────────────────
-    repo_url = env("GITHUB_REPO_URL", "")
-    branch = env("GITHUB_REPO_BRANCH", "main")
-    if not repo_url:
-        raise RuntimeError("GITHUB_REPO_URL is required.")
-    clone_or_pull(repo_url, local_repo, branch)
+    if not token:
+        raise RuntimeError("GITHUB_CONTENTS_TOKEN is required.")
 
-    # ── 2. Read all gamesN.json from local disk ─────────────────────────
-    existing = read_catalogue(local_repo, data_dir)
-    STATUS.update_files(discover_games_files(local_repo, data_dir), len(existing))
+    print(f"\n{'=' * 60}")
+    print(f"CYCLE START at {datetime.now(timezone.utc).isoformat()}")
+    print(f"{'=' * 60}")
+
+    # ── 1. DISCOVER files: How many gamesN.json exist in data/? ────────
+    existing, file_info = read_catalogue(owner, repo, branch, data_dir)
+    file_names = [fi["name"] for fi in file_info.values()]
+    STATUS.update_files(file_names, len(existing))
 
     by_slug = {text(g.get("slug")): g for g in existing if text(g.get("slug"))}
     imported: list[dict[str, Any]] = []
     cycle_limit = args.limit if (args.dry_run or args.once) else 1
 
-    # ── 3. Fetch ONLY page 1 from FitGirl ──────────────────────────────
+    # ── 2. Fetch ONLY page 1 from FitGirl ─────────────────────────────
     page = get_with_retries(f"{fg_base}/latest?page=1")
     results = page.get("results", []) if isinstance(page, dict) else page
     if not isinstance(results, list):
         raise RuntimeError("Unexpected /latest response.")
 
-    print(f"[scan] page 1: {len(results)} result(s), checking for new...")
+    print(f"[scan] FitGirl page 1: {len(results)} result(s), checking for new...")
 
-    # ── 4. Check each game ──────────────────────────────────────────────
+    # ── 3. Check each game ─────────────────────────────────────────────
     for summary in results:
         if not isinstance(summary, dict) or should_skip(summary):
             continue
@@ -754,26 +793,26 @@ def run_cycle(args: argparse.Namespace) -> int:
         game = map_game(summary, detail, by_slug.get(slug), dl_base, gog)
         imported.append(game)
         by_slug[slug] = game
-        print(f"  NEW: {game['title']} -> {game['download_url']}")
+        print(f"  ★ NEW: {game['title']} -> {game['download_url']}")
 
         if len(imported) >= cycle_limit:
             break
         time.sleep(max(0, args.delay))
 
-    # ── 5. No new games ─────────────────────────────────────────────────
+    # ── 4. No new ──────────────────────────────────────────────────────
     if not imported:
         print("No new games on page 1.")
         STATUS.update_cycle("no new releases")
         return 0
 
-    # ── 6. Dry run ──────────────────────────────────────────────────────
+    # ── 5. Dry run ─────────────────────────────────────────────────────
     if args.dry_run:
         print(json.dumps(imported, ensure_ascii=False, indent=2))
-        print(f"Dry run: {len(imported)} mapped. Nothing written.")
+        print(f"Dry run: {len(imported)} mapped. GitHub unchanged.")
         STATUS.update_cycle(f"dry run: {len(imported)}")
         return 0
 
-    # ── 7. Merge and write to disk ──────────────────────────────────────
+    # ── 6. Merge and write ─────────────────────────────────────────────
     merged = [
         g for g in existing
         if text(g.get("slug")) not in {item["slug"] for item in imported}
@@ -781,13 +820,10 @@ def run_cycle(args: argparse.Namespace) -> int:
     merged.extend(imported)
     merged.sort(key=lambda g: g.get("created_at", ""), reverse=True)
 
-    written = write_catalogue(local_repo, data_dir, merged)
+    write_catalogue(owner, repo, branch, data_dir, merged, file_info,
+                    f"Import {len(imported)} FitGirl release(s)")
 
-    # ── 8. Git commit + push ────────────────────────────────────────────
-    msg = f"Import {len(imported)} FitGirl release(s): {', '.join(g['slug'] for g in imported)}"
-    pushed = commit_and_push(local_repo, branch, msg)
-
-    print(f"Updated: {len(imported)} new, {len(merged)} total, {len(written)} file(s), pushed={pushed}")
+    print(f"Updated: {len(imported)} new, {len(merged)} total.")
     STATUS.increment_imported(len(imported))
     STATUS.update_cycle(f"imported {len(imported)} release(s)")
     return 0
