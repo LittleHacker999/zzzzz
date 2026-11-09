@@ -9,6 +9,10 @@ Each cycle:
   5. Imports eligible releases into the first gamesN.json file with capacity.
   6. Advances the scan state and writes .fg_import_state.json.
 
+Health web server (started in every mode):
+  GET /            HTML status page (auto-refreshes)
+  GET /api/health  {"working": true}
+  GET /api/status  detailed JSON status
 """
 
 from __future__ import annotations
@@ -23,11 +27,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -38,6 +44,114 @@ IMAGE_URL_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)(?:[?#].*)?$", re.IGNOR
 SKIP_RE = re.compile(r"(?:upcoming[- ]repacks?|updates?[- ]digest|digest[- ]updates?)", re.IGNORECASE)
 GAMES_RE = re.compile(r"^games(?P<index>\d*)\.json$", re.IGNORECASE)
 
+
+# ---------------------------------------------------------------------------
+# Shared status (exposed by the health web server)
+# ---------------------------------------------------------------------------
+
+class ServiceStatus:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.cycles = 0
+        self.last_cycle_at = None
+        self.last_cycle_result = "never run"
+        self.total_imported = 0
+        self.last_error = None
+        self.games_files = []
+        self.total_games = 0
+        self.last_scanned_page = 0
+        self.api_last_page = 0
+        self.backfill_complete = False
+
+    def update(self, **kwargs):
+        with self._lock:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "working": True,
+                "started_at": self.started_at,
+                "cycles": self.cycles,
+                "last_cycle_at": self.last_cycle_at,
+                "last_cycle_result": self.last_cycle_result,
+                "total_imported": self.total_imported,
+                "last_error": self.last_error,
+                "games_files": list(self.games_files),
+                "total_games": self.total_games,
+                "last_scanned_page": self.last_scanned_page,
+                "api_last_page": self.api_last_page,
+                "backfill_complete": self.backfill_complete,
+            }
+
+
+STATUS = ServiceStatus()
+
+
+# ---------------------------------------------------------------------------
+# Health web server (stdlib only)
+# ---------------------------------------------------------------------------
+
+_HTML_HEAD = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Repack X Importer</title>
+<meta http-equiv="refresh" content="30">
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;margin:2rem}
+h1{color:#58a6ff} .ok{color:#3fb950}
+table{border-collapse:collapse} td,th{border:1px solid #30363d;padding:.4rem .8rem;text-align:left}
+code{color:#79c0ff}
+</style></head><body>
+"""
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json"):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        snap = STATUS.snapshot()
+        if path == "/api/health":
+            self._send(200, json.dumps({"working": True}))
+        elif path == "/api/status":
+            self._send(200, json.dumps(snap, indent=2))
+        elif path in ("/", "/index.html"):
+            rows = "".join(
+                f"<tr><th>{k}</th><td><code>{v}</code></td></tr>"
+                for k, v in snap.items()
+            )
+            html = (
+                _HTML_HEAD
+                + "<h1>Repack X — FitGirl importer</h1>"
+                + '<p class="ok">&#9679; working: true</p>'
+                + f"<table>{rows}</table>"
+                + "<p>JSON: <a href='/api/health'>/api/health</a> · "
+                + "<a href='/api/status'>/api/status</a> (auto-refresh 30s)</p>"
+                + "</body></html>"
+            )
+            self._send(200, html, "text/html; charset=utf-8")
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def log_message(self, *args):  # silence request logs
+        pass
+
+
+def start_health_server(host: str, port: int) -> None:
+    server = HTTPServer((host, port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Health web server listening on http://{host}:{port}  (/api/health -> {{\"working\": true}})")
+
+
+# ---------------------------------------------------------------------------
 
 def env(name: str, default: str) -> str:
     return os.environ.get(name, default).strip()
@@ -385,6 +499,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=env_int("FITGIRL_IMPORT_LIMIT", 1))
     parser.add_argument("--once", action="store_true", default=env_bool("FITGIRL_IMPORT_ONCE"))
     parser.add_argument("--dry-run", action="store_true", default=env_bool("FITGIRL_IMPORT_DRY_RUN"))
+    parser.add_argument("--health-port", type=int, default=env_int("HEALTH_PORT", 8080))
+    parser.add_argument("--health-host", default=env("HEALTH_HOST", "0.0.0.0"))
     return parser.parse_args()
 
 
@@ -417,6 +533,11 @@ def run_cycle(args: argparse.Namespace) -> int:
                 slug = text(game.get("slug"))
                 if slug:
                     by_slug[slug] = game
+
+        STATUS.update(
+            games_files=[name for _, name, _ in files],
+            total_games=sum(len(records) for records in records_by_file.values()),
+        )
 
         page_payloads: dict[int, Any] = {}
         page_order = [current_page] if current_page == 1 else [current_page, 1]
@@ -494,7 +615,24 @@ def run_cycle(args: argparse.Namespace) -> int:
             print(f"Local import state updated: {state_file}")
         else:
             print(json.dumps(new_state, indent=2))
+
+        STATUS.update(
+            cycles=STATUS.cycles + 1,
+            last_cycle_at=datetime.now(timezone.utc).isoformat(),
+            last_cycle_result=f"imported {len(imported)} new game(s)",
+            total_imported=STATUS.total_imported + len(imported),
+            last_error=None,
+            last_scanned_page=new_state["lastScannedPage"],
+            api_last_page=last_page,
+            backfill_complete=new_state["lastScannedPage"] >= last_page,
+        )
         return len(imported)
+    except Exception as error:
+        STATUS.update(
+            last_error=f"{type(error).__name__}: {error}",
+            last_cycle_result="error",
+        )
+        raise
     finally:
         shutil.rmtree(clone_root.parent, ignore_errors=True)
 
@@ -503,6 +641,7 @@ def main() -> int:
     args = parse_args()
     if args.interval < 1 or args.delay < 0 or args.limit < 1:
         raise RuntimeError("interval and limit must be positive; delay cannot be negative")
+    start_health_server(args.health_host, args.health_port)
     if args.once or args.dry_run:
         return run_cycle(args)
     print("Continuous FitGirl import mode started.")
