@@ -1,42 +1,14 @@
 #!/usr/bin/env python3
-"""Import FitGirl latest releases into the Repack X GitHub JSON catalogue.
+"""Continuously import FitGirl releases into a GitHub gamesN.json catalogue.
 
-At startup AND every cycle, the code:
-  1. Asks GitHub "how many gamesN.json files exist in data/?" (auto-discovery)
-  2. Reads ALL discovered files and merges all games
-  3. Checks FitGirl /latest?page=1 for new games
-  4. Writes games1.json, games2.json, ... back (auto-split at 850 KB)
+Each cycle:
+  1. Clones the catalogue repository into a temporary directory.
+  2. Finds every data/gamesN.json file, including intentionally empty files.
+  3. Reads .fg_import_state.json for the last scanned page and API lastPage.
+  4. Fetches the current page and page one to catch both scheduled and new releases.
+  5. Imports eligible releases into the first gamesN.json file with capacity.
+  6. Advances the scan state and writes .fg_import_state.json.
 
-Health-check endpoints:
-  GET /             → HTML status page
-  GET /api/health   → {"working": true}
-  GET /api/status   → detailed JSON
-
-Required:
-  GITHUB_CONTENTS_TOKEN   Fine-grained token with Contents: Read and write
-
-Optional:
-  GITHUB_REPO_OWNER       Default: LittleHacker999
-  GITHUB_REPO_NAME        Default: musical-guacamole
-  GITHUB_REPO_BRANCH      Default: main
-  GITHUB_DATA_DIR         Default: data
-  FITGIRL_API_BASE_URL    Default: https://fitgirl-api-5rbz.onrender.com
-  REPACK_X_DOWNLOAD_BASE  Default: https://repack-x-database.vercel.app
-  FITGIRL_IMPORT_LIMIT    Default: 1
-  FITGIRL_IMPORT_DELAY     Default: 0.25
-  FITGIRL_IMPORT_INTERVAL  Default: 3600
-  FITGIRL_IMPORT_ONCE      Default: false
-  FITGIRL_IMPORT_DRY_RUN   Default: false
-  FITGIRL_IMPORT_FORCE     Default: false
-  FITGIRL_FETCH_GOG        Default: true
-  GOG_IMPORT_DELAY         Default: 0.25
-  HEALTH_PORT              Default: 8080
-  HEALTH_HOST              Default: 0.0.0.0
-
-Examples:
-  python scripts/import_fitgirl_latest.py --dry-run
-  python scripts/import_fitgirl_latest.py --once
-  python scripts/import_fitgirl_latest.py
 """
 
 from __future__ import annotations
@@ -47,167 +19,24 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
-import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from typing import Any, Iterable
 
 DEFAULT_FITGIRL_API = "https://fitgirl-api-5rbz.onrender.com"
 DEFAULT_DOWNLOAD_BASE = "https://repack-x-database.vercel.app"
-DEFAULT_GOG_DELAY = 0.25
-DEFAULT_HEALTH_PORT = 8080
-DEFAULT_HEALTH_HOST = "0.0.0.0"
-DEFAULT_DATA_DIR = "data"
-CHUNK_MAX_BYTES = 850_000
-
+DEFAULT_MAX_BYTES = 900_000
 IMAGE_URL_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)(?:[?#].*)?$", re.IGNORECASE)
 SKIP_RE = re.compile(r"(?:upcoming[- ]repacks?|updates?[- ]digest|digest[- ]updates?)", re.IGNORECASE)
-GAMES_FILE_RE = re.compile(r"^games(\d*)\.json$", re.IGNORECASE)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SERVICE STATUS
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class ServiceStatus:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.started_at = datetime.now(timezone.utc).isoformat()
-        self.last_cycle_at = ""
-        self.last_cycle_result = ""
-        self.total_imported = 0
-        self.last_error = ""
-        self.games_files: list[str] = []
-        self.total_games = 0
-
-    def update_cycle(self, result: str, error: str = "") -> None:
-        with self._lock:
-            self.last_cycle_at = datetime.now(timezone.utc).isoformat()
-            self.last_cycle_result = result
-            self.last_error = error
-
-    def increment_imported(self, count: int = 1) -> None:
-        with self._lock:
-            self.total_imported += count
-
-    def update_files(self, files: list[str], total: int) -> None:
-        with self._lock:
-            self.games_files = list(files)
-            self.total_games = total
-
-    def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "working": True,
-                "started_at": self.started_at,
-                "last_cycle_at": self.last_cycle_at,
-                "last_cycle_result": self.last_cycle_result,
-                "total_imported": self.total_imported,
-                "last_error": self.last_error,
-                "games_files": list(self.games_files),
-                "total_games": self.total_games,
-            }
-
-
-STATUS = ServiceStatus()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  HEALTH-CHECK WEB SERVER
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        path = self.path.split("?")[0].rstrip("/") or "/"
-        if path == "/":
-            self._send_html()
-        elif path == "/api/health":
-            self._send_json({"working": True})
-        elif path == "/api/status":
-            self._send_json(STATUS.snapshot())
-        else:
-            self._send_json({"error": "Not found"}, 404)
-
-    def _send_json(self, data: dict[str, Any], code: int = 200) -> None:
-        body = json.dumps(data, indent=2).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _send_html(self) -> None:
-        s = STATUS.snapshot()
-        err = (
-            f'<span class="badge error">{s["last_error"]}</span>'
-            if s["last_error"]
-            else '<span class="badge ok">No errors</span>'
-        )
-        files = ", ".join(s["games_files"]) or "None yet"
-        html = f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FitGirl Importer</title><style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;
-display:flex;justify-content:center;align-items:center;min-height:100vh}}
-.card{{background:#161b22;border:1px solid #30363d;border-radius:12px;
-padding:40px 48px;max-width:580px;width:90%}}
-h1{{color:#58a6ff;font-size:1.6rem;margin-bottom:6px}}
-.sub{{color:#8b949e;margin-bottom:28px;font-size:.95rem}}
-.row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #21262d}}
-.row:last-child{{border-bottom:none}}
-.lab{{color:#8b949e;font-size:.88rem}}
-.val{{color:#c9d1d9;font-size:.88rem;font-weight:600;text-align:right;max-width:300px;word-break:break-word}}
-.badge{{padding:3px 10px;border-radius:20px;font-size:.82rem;font-weight:600}}
-.badge.ok{{background:#1a3c2a;color:#3fb950}}
-.badge.error{{background:#3c1a1a;color:#f85149}}
-.pulse{{display:inline-block;width:10px;height:10px;background:#3fb950;
-border-radius:50%;margin-right:6px;animation:p 1.5s ease-in-out infinite}}
-@keyframes p{{0%,100%{{opacity:1}}50%{{opacity:.4}}}}
-.links{{margin-top:24px;padding-top:16px;border-top:1px solid #21262d}}
-.links a{{color:#58a6ff;text-decoration:none;display:block;padding:4px 0}}
-</style></head><body><div class="card">
-<h1><span class="pulse"></span>FitGirl Importer</h1>
-<p class="sub">Health-check service</p>
-<div class="row"><span class="lab">Status</span><span class="val"><span class="badge ok">Working</span></span></div>
-<div class="row"><span class="lab">Started</span><span class="val">{s["started_at"]}</span></div>
-<div class="row"><span class="lab">Last cycle</span><span class="val">{s["last_cycle_at"] or "Not yet"}</span></div>
-<div class="row"><span class="lab">Last result</span><span class="val">{s["last_cycle_result"] or "\u2014"}</span></div>
-<div class="row"><span class="lab">Total imported</span><span class="val">{s["total_imported"]}</span></div>
-<div class="row"><span class="lab">Total games</span><span class="val">{s["total_games"]}</span></div>
-<div class="row"><span class="lab">Game files</span><span class="val">{files}</span></div>
-<div class="row"><span class="lab">Errors</span><span class="val">{err}</span></div>
-<div class="links"><a href="/api/health">/api/health</a><a href="/api/status">/api/status</a></div>
-</div></body></html>"""
-        body = html.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *a: Any) -> None:
-        pass
-
-
-def start_health_server(host: str, port: int) -> None:
-    server = HTTPServer((host, port), HealthHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    print(f"[health] http://{host}:{port}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ENV HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
+GAMES_RE = re.compile(r"^games(?P<index>\d*)\.json$", re.IGNORECASE)
 
 
 def env(name: str, default: str) -> str:
@@ -215,497 +44,176 @@ def env(name: str, default: str) -> str:
 
 
 def env_int(name: str, default: int) -> int:
-    v = env(name, str(default))
+    value = env(name, str(default))
     try:
-        return int(v)
-    except ValueError as e:
-        raise RuntimeError(f"{name} must be integer, got {v!r}") from e
+        return int(value)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be an integer, received: {value!r}") from error
 
 
 def env_float(name: str, default: float) -> float:
-    v = env(name, str(default))
+    value = env(name, str(default))
     try:
-        return float(v)
-    except ValueError as e:
-        raise RuntimeError(f"{name} must be number, got {v!r}") from e
+        return float(value)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be a number, received: {value!r}") from error
 
 
 def env_bool(name: str, default: bool = False) -> bool:
-    v = env(name, "true" if default else "false").lower()
-    if v in {"1", "true", "yes", "on"}:
+    value = env(name, "true" if default else "false").lower()
+    if value in {"1", "true", "yes", "on"}:
         return True
-    if v in {"0", "false", "no", "off"}:
+    if value in {"0", "false", "no", "off"}:
         return False
-    raise RuntimeError(f"{name} must be bool, got {v!r}")
+    raise RuntimeError(f"{name} must be true or false, received: {value!r}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  HTTP LAYER
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def fetch_json(url: str, headers: dict[str, str] | None = None, timeout: int = 90) -> Any:
-    hdr = {"Accept": "application/json", "User-Agent": "Repack-X-Importer/1.0"}
-    if headers:
-        hdr.update(headers)
-    req = urllib.request.Request(url, headers=hdr)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        d = e.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"HTTP {e.code} from {url}: {d}") from e
-
-
-def get_with_retries(url: str, retries: int = 3) -> Any:
-    last: Exception | None = None
-    for i in range(retries):
-        try:
-            return fetch_json(url)
-        except Exception as e:
-            last = e
-            if i + 1 < retries:
-                time.sleep(2**i)
-    raise RuntimeError(f"Could not fetch {url}: {last}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  GITHUB API HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def gh_headers() -> dict[str, str]:
-    token = os.environ.get("GITHUB_CONTENTS_TOKEN", "").strip()
-    h = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "Repack-X-Importer/1.0",
-        "X-GitHub-Api-Version": "2022-11-28",
+def api_json(url: str, *, token: str | None = None, method: str = "GET", payload: dict[str, Any] | None = None) -> tuple[Any, dict[str, str]]:
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {
+        "Accept": "application/vnd.github+json" if "api.github.com" in url else "application/json",
+        "User-Agent": "Repack-X-FitGirl-Importer/2.0",
     }
     if token:
-        h["Authorization"] = f"Bearer {token}"
-    return h
-
-
-def gh_url(owner: str, repo: str, path: str) -> str:
-    parts = "/".join(urllib.parse.quote(p, safe="") for p in path.strip("/").split("/"))
-    return f"https://api.github.com/repos/{owner}/{repo}/contents/{parts}"
-
-
-def gh_request(url: str, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
-    body = json.dumps(payload).encode() if payload else None
-    hdr = gh_headers()
-    if body:
-        hdr["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=body, headers=hdr, method=method)
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        d = e.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"HTTP {e.code} from {url}: {d}") from e
+        with urllib.request.urlopen(request, timeout=90) as response:
+            return json.loads(response.read().decode("utf-8")), {k.lower(): v for k, v in response.headers.items()}
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:1000]
+        raise RuntimeError(f"HTTP {error.code} from {url}: {detail}") from error
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  ★ FILE DISCOVERY: Find all gamesN.json in data/ folder ★
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def discover_games_files(
-    owner: str, repo: str, branch: str, data_dir: str
-) -> list[dict[str, Any]]:
-    """
-    ★ Asks GitHub: "How many gamesN.json files exist in {data_dir}/?" ★
-
-    Single API call:
-      GET /repos/{owner}/{repo}/contents/{data_dir}?ref={branch}
-
-    Scans every item, matches games*.json pattern, returns sorted by number.
-
-    Returns:
-      [
-        {"name": "games1.json", "path": "data/games1.json", "sha": "abc", "number": 1},
-        {"name": "games2.json", "path": "data/games2.json", "sha": "def", "number": 2},
-        {"name": "games3.json", "path": "data/games3.json", "sha": "ghi", "number": 3},
-      ]
-    """
-    url = gh_url(owner, repo, data_dir) + "?ref=" + urllib.parse.quote(branch)
-
-    print(f"[discovery] Asking GitHub: what files exist in '{data_dir}/'?")
-    print(f"[discovery] GET {url}")
-
-    payload = gh_request(url)
-
-    if not isinstance(payload, list):
-        print(f"[discovery] WARNING: expected a list, got {type(payload).__name__}")
-        return []
-
-    print(f"[discovery] GitHub returned {len(payload)} item(s) in '{data_dir}/':")
-    for item in payload:
-        item_type = item.get("type", "?")
-        item_name = item.get("name", "?")
-        marker = "📄" if item_type == "file" else "📁"
-        print(f"[discovery]   {marker} {item_name} ({item_type})")
-
-    # Now filter: only games*.json files
-    found: list[dict[str, Any]] = []
-    for item in payload:
-        if not isinstance(item, dict) or item.get("type") != "file":
-            continue
-        name = item.get("name", "")
-        match = GAMES_FILE_RE.match(name)
-        if match:
-            num = int(match.group(1)) if match.group(1) else 0
-            found.append({
-                "name": name,
-                "path": item.get("path", f"{data_dir}/{name}"),
-                "sha": item.get("sha", ""),
-                "number": num,
-            })
-            print(f"[discovery]   ✅ MATCH: {name} (number={num})")
-        else:
-            print(f"[discovery]   ❌ skip: {name} (not games*.json)")
-
-    found.sort(key=lambda x: x["number"])
-
-    print(f"[discovery] ═══════════════════════════════════════")
-    print(f"[discovery] FOUND {len(found)} games file(s):")
-    for f in found:
-        print(f"[discovery]   {f['number']}. {f['name']}  sha={f['sha'][:8]}...")
-    print(f"[discovery] ═══════════════════════════════════════")
-
-    return found
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  READ ALL gamesN.json
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def read_catalogue(
-    owner: str, repo: str, branch: str, data_dir: str
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    files = discover_games_files(owner, repo, branch, data_dir)
-
-    games: list[dict[str, Any]] = []
-    file_info: dict[str, dict[str, Any]] = {}
-
-    for fi in files:
-        url = gh_url(owner, repo, fi["path"]) + "?ref=" + urllib.parse.quote(branch)
+def get_with_retries(url: str, retries: int = 4) -> Any:
+    last_error: Exception | None = None
+    for attempt in range(retries):
         try:
-            payload = gh_request(url)
-        except RuntimeError as e:
-            if "404" in str(e):
-                print(f"[read]   {fi['name']}: 404, skipping")
-                continue
-            raise
-
-        file_info[fi["path"]] = {"sha": payload.get("sha", fi.get("sha", "")), "name": fi["name"]}
-
-        try:
-            content = base64.b64decode(
-                str(payload.get("content", "")).replace("\n", "")
-            ).decode("utf-8")
-            parsed = json.loads(content)
-        except Exception:
-            print(f"[read]   {fi['name']}: invalid JSON, skipping")
-            continue
-
-        if isinstance(parsed, list):
-            games.extend(parsed)
-            print(f"[read]   {fi['name']}: loaded {len(parsed)} game(s)")
-        elif isinstance(parsed, dict) and isinstance(parsed.get("games"), list):
-            games.extend(parsed["games"])
-            print(f"[read]   {fi['name']}: loaded {len(parsed['games'])} game(s)")
-        else:
-            print(f"[read]   {fi['name']}: unknown format, skipping")
-
-    print(f"[read] TOTAL: {len(games)} game(s) from {len(file_info)} file(s)")
-    return games, file_info
+            return api_json(url)[0]
+        except Exception as error:
+            last_error = error
+            if attempt + 1 < retries:
+                time.sleep(min(30, 2 ** attempt))
+    raise RuntimeError(f"Could not fetch {url}: {last_error}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  WRITE CATALOGUE
-# ═══════════════════════════════════════════════════════════════════════════
+def text(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("name", "title", "text", "url"):
+            if value.get(key):
+                return str(value[key]).strip()
+        return ""
+    return str(value).strip() if value is not None else ""
 
 
-def _split_chunks(games: list[dict[str, Any]], max_bytes: int) -> list[list[dict[str, Any]]]:
-    chunks: list[list[dict[str, Any]]] = []
-    cur: list[dict[str, Any]] = []
-    size = 4
-    for g in games:
-        raw = json.dumps(g, ensure_ascii=False, indent=2)
-        lines = raw.count("\n") + 1
-        item = len(raw.encode("utf-8")) + lines * 2 + 2
-        if cur and size + item > max_bytes:
-            chunks.append(cur)
-            cur = [g]
-            size = 4 + item
-        else:
-            cur.append(g)
-            size += item
-    if cur:
-        chunks.append(cur)
-    return chunks or [[]]
-
-
-def write_catalogue(
-    owner: str, repo: str, branch: str, data_dir: str,
-    games: list[dict[str, Any]], file_info: dict[str, dict[str, Any]], message: str,
-) -> None:
-    chunks = _split_chunks(games, CHUNK_MAX_BYTES)
-    total_kb = len(json.dumps(games, ensure_ascii=False, indent=2).encode()) / 1024
-    print(f"[write] {len(games)} game(s) -> {len(chunks)} file(s), total {total_kb:.0f} KB")
-
-    new_paths: set[str] = set()
-    for i, chunk in enumerate(chunks):
-        name = f"games{i + 1}.json"
-        path = f"{data_dir}/{name}"
-        raw = json.dumps(chunk, ensure_ascii=False, indent=2) + "\n"
-        sz = len(raw.encode("utf-8"))
-        if sz > 1_000_000:
-            raise RuntimeError(f"{name} is {sz / 1024:.0f} KB; exceeds 1 MB")
-
-        sha = file_info.get(path, {}).get("sha", "")
-        data = {"message": message, "content": base64.b64encode(raw.encode()).decode("ascii"), "branch": branch}
-        if sha:
-            data["sha"] = sha
-        gh_request(gh_url(owner, repo, path), method="PUT", payload=data)
-        new_paths.add(path)
-        print(f"[write]   {name}: {len(chunk)} game(s), {sz / 1024:.0f} KB")
-
-    for path, info in file_info.items():
-        if path not in new_paths:
-            sha = info.get("sha")
-            if sha:
-                try:
-                    gh_request(gh_url(owner, repo, path), method="DELETE", payload={
-                        "message": f"Remove orphaned {info.get('name', path)}",
-                        "sha": sha, "branch": branch,
-                    })
-                    print(f"[write]   removed {info.get('name', path)}")
-                except Exception:
-                    pass
-
-    print(f"[write] done: {len(new_paths)} file(s)")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  DATA-CLEANING HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def as_list(v: Any) -> list[Any]:
-    if v is None:
+def as_list(value: Any) -> list[Any]:
+    if value is None:
         return []
-    return v if isinstance(v, list) else [v]
+    return value if isinstance(value, list) else [value]
 
 
-def text(v: Any) -> str:
-    if isinstance(v, dict):
-        for k in ("name", "title", "text", "url"):
-            if v.get(k):
-                return str(v[k]).strip()
-        return ""
-    return str(v).strip() if v is not None else ""
-
-
-def unique_strings(vals: Iterable[Any]) -> list[str]:
-    out: list[str] = []
+def unique_strings(values: Iterable[Any]) -> list[str]:
+    result: list[str] = []
     seen: set[str] = set()
-    for v in vals:
-        s = text(v)
-        if s and s.casefold() not in seen:
-            seen.add(s.casefold())
-            out.append(s)
-    return out
+    for value in values:
+        item = text(value)
+        if item and item.casefold() not in seen:
+            seen.add(item.casefold())
+            result.append(item)
+    return result
 
 
-def nested_urls(v: Any) -> Iterable[str]:
-    if isinstance(v, str):
-        yield v.strip()
-    elif isinstance(v, list):
-        for i in v:
-            yield from nested_urls(i)
-    elif isinstance(v, dict):
-        for k in ("url", "image", "src", "thumbnail"):
-            if v.get(k):
-                yield from nested_urls(v[k])
+def nested_urls(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value.strip()
+    elif isinstance(value, list):
+        for item in value:
+            yield from nested_urls(item)
+    elif isinstance(value, dict):
+        for key in ("url", "image", "src", "thumbnail"):
+            if value.get(key):
+                yield from nested_urls(value[key])
 
 
-def image_urls(v: Any) -> list[str]:
-    out: list[str] = []
+def image_urls(value: Any) -> list[str]:
+    result: list[str] = []
     seen: set[str] = set()
-    for u in nested_urls(v):
-        if u and re.match(r"^https?://", u, re.IGNORECASE) and IMAGE_URL_RE.search(u) and u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+    for url in nested_urls(value):
+        if re.match(r"^https?://", url, re.IGNORECASE) and IMAGE_URL_RE.search(url) and url not in seen:
+            seen.add(url)
+            result.append(url)
+    return result
 
 
-def clean_slug(v: Any) -> str:
-    return re.sub(r"[^a-z0-9-]", "", text(v).lower())
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  GOG ENRICHMENT
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def clean_title_for_gog(title: str) -> str:
-    v = re.sub(r"\[.*?\]", " ", title or "")
-    v = re.sub(r"\((?:[^)]*(?:repack|build|dlc|patch|update|v\s*\d|fitgirl|dodi)[^)]*)\)", " ", v, flags=re.IGNORECASE)
-    v = re.sub(r"\b(?:fitgirl|dodi|elamigos|mr\s*dj|xatab|codex|skidrow|reloaded|plaza|empress)\b.*$", " ", v, flags=re.IGNORECASE)
-    v = re.sub(r"\+\s*(?:\d+|all)?\s*dlcs?\b.*$", " ", v, flags=re.IGNORECASE)
-    v = re.sub(r"\b(?:v|ver\.?|version|build|patch)\s*[\d._-]+[a-z]?\b.*$", " ", v, flags=re.IGNORECASE)
-    return re.sub(r"\s{2,}", " ", re.sub(r"[:\-–—/]", " ", v)).strip()
-
-
-def _title_score(s: str, p: str) -> float:
-    sw = {"the", "and", "for", "with", "all", "edition", "bundle"}
-    a = [re.sub(r"[^a-z0-9]", "", w) for w in s.lower().split()]
-    b = [re.sub(r"[^a-z0-9]", "", w) for w in p.lower().split()]
-    a = [w for w in a if len(w) > 2 and w not in sw]
-    b = [w for w in b if len(w) > 2 and w not in sw]
-    if not a:
-        return 1.0
-    return sum(any(x in y or y in x for x in b) for y in a) / len(a)
-
-
-def _gog_sysreq(os_list: Any) -> str:
-    if not isinstance(os_list, list) or not os_list:
-        return ""
-    win = next(
-        (i for i in os_list if str(i.get("operatingSystem", {}).get("name", "")).lower() == "windows"),
-        os_list[0],
-    )
-    groups = win.get("systemRequirements") if isinstance(win, dict) else None
-    if not isinstance(groups, list):
-        return ""
-    sections = []
-    for g in groups:
-        if not isinstance(g, dict):
-            continue
-        lines = []
-        for r in g.get("requirements", []):
-            if not isinstance(r, dict):
-                continue
-            n = str(r.get("name") or r.get("id") or "").rstrip(":").strip()
-            d = str(r.get("description") or "").strip()
-            if n and d:
-                lines.append(f"{n}: {d}")
-            elif d:
-                lines.append(d)
-        if g.get("description"):
-            lines.append(str(g["description"]).strip())
-        if lines:
-            sections.append(f"{str(g.get('type') or 'Req').upper()}:\n" + "\n".join(lines))
-    return "\n\n".join(sections).strip()
-
-
-def _clean_gog_url(v: Any) -> str:
-    u = text(v)
-    u = re.sub(r"\{formatter\}", "", u)
-    return "https://" + u[7:] if u.startswith("http://") else u
-
-
-def fetch_gog_metadata(title: str, delay: float = DEFAULT_GOG_DELAY) -> dict[str, Any]:
-    q = clean_title_for_gog(title)
-    if not q:
-        return {}
-    try:
-        cat = get_with_retries(f"https://catalog.gog.com/v1/catalog?query={urllib.parse.quote(q)}&limit=10")
-        products = [p for p in (cat.get("products", []) if isinstance(cat, dict) else []) if isinstance(p, dict) and _title_score(q, text(p.get("title"))) >= 0.25]
-        if not products:
-            return {}
-        prod = next((i for i in products if text(i.get("title")).casefold() == q.casefold()), products[0])
-        pid = prod.get("id")
-        if not pid:
-            return {}
-        time.sleep(max(0, delay))
-        det = get_with_retries(f"https://api.gog.com/v2/games/{urllib.parse.quote(str(pid), safe='')}")
-        return {
-            "cover_url": _clean_gog_url(prod.get("coverVertical") or prod.get("image")),
-            "screenshots": image_urls([_clean_gog_url(u) for u in as_list(prod.get("screenshots"))]),
-            "genres": [g for g in unique_strings([
-                *(i.get("name") if isinstance(i, dict) else i for i in as_list(prod.get("genres"))),
-                *(i.get("name") if isinstance(i, dict) else i for i in as_list(prod.get("tags"))),
-            ]) if g.casefold() != "lossless repack"],
-            "system_requirements": _gog_sysreq(det.get("_embedded", {}).get("supportedOperatingSystems")),
-        }
-    except Exception as e:
-        print(f"[gog] skip for {title}: {e}")
-        return {}
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  RECORD HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
+def clean_slug(value: Any) -> str:
+    # Kept only for legacy callers. Imported records preserve the API slug exactly.
+    return re.sub(r"[^a-z0-9-]", "", text(value).lower())
 
 
 def should_skip(item: dict[str, Any]) -> bool:
-    t = text(item.get("title"))
-    s = text(item.get("slug"))
-    return not s or bool(SKIP_RE.search(t) or SKIP_RE.search(s))
+    title = text(item.get("title"))
+    slug = text(item.get("slug"))
+    return not slug or bool(SKIP_RE.search(title) or SKIP_RE.search(slug))
 
 
 def has_download_links(detail: dict[str, Any]) -> bool:
-    def walk(v: Any) -> Iterable[str]:
-        if isinstance(v, str):
-            if v.strip():
-                yield v.strip()
-        elif isinstance(v, list):
-            for i in v:
-                yield from walk(i)
-        elif isinstance(v, dict):
-            for i in v.values():
-                yield from walk(i)
-    return any(
-        re.match(r"^(?:https?://|magnet:\?)", v, re.IGNORECASE)
-        for f in (detail.get("downloadMirrors"), detail.get("torrents"))
-        for v in walk(f)
-    )
+    def walk(value: Any) -> Iterable[str]:
+        if isinstance(value, str):
+            if value.strip():
+                yield value.strip()
+        elif isinstance(value, list):
+            for item in value:
+                yield from walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from walk(item)
+
+    fields = (detail.get("downloadMirrors"), detail.get("torrents"), detail.get("magnets"), detail.get("mirrors"))
+    return any(re.match(r"^(?:https?://|magnet:\?)", value, re.IGNORECASE) for field in fields for value in walk(field))
 
 
 def description(detail: dict[str, Any]) -> str:
-    p = unique_strings(as_list(detail.get("gameDescription")))
-    f = unique_strings(as_list(detail.get("repackFeatures")))
-    sec: list[str] = []
-    if p:
-        sec.append("\n\n".join(p))
-    if f:
-        sec.append("**Repack Features**\n\n" + "\n".join(f"- {i}" for i in f))
-    return "\n\n".join(sec) or "Not Found"
+    paragraphs = unique_strings(as_list(detail.get("gameDescription")))
+    features = unique_strings(as_list(detail.get("repackFeatures")))
+    sections: list[str] = []
+    if paragraphs:
+        sections.append("\n\n".join(paragraphs))
+    if features:
+        sections.append("**Repack Features**\n\n" + "\n".join(f"- {item}" for item in features))
+    return "\n\n".join(sections) or "Not Found"
 
 
 def deterministic_id(slug: str) -> str:
-    d = hashlib.sha256(f"fitgirl:{slug}".encode()).hexdigest()
-    return f"{d[:8]}-{d[8:12]}-5{d[13:16]}-{d[16:20]}-{d[20:32]}"
+    digest = hashlib.sha256(f"fitgirl:{slug}".encode("utf-8")).hexdigest()
+    return f"{digest[:8]}-{digest[8:12]}-5{digest[13:16]}-{digest[16:20]}-{digest[20:32]}"
 
 
-def map_game(
-    summary: dict[str, Any], detail: dict[str, Any],
-    existing: dict[str, Any] | None, dl_base: str,
-    gog: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    slug = clean_slug(detail.get("slug") or summary.get("slug"))
-    cats = unique_strings([*as_list(detail.get("genres")), *as_list(detail.get("tags")), detail.get("category")])
-    cats = [c for c in cats if c.casefold() != "lossless repack"]
-    cats = unique_strings([*cats, *((gog or {}).get("genres") or [])])
-    rs = text(detail.get("repackSize")) or "Not Found"
-    rs = re.sub(r"\s*\[selective download\]\s*$", "", rs, flags=re.IGNORECASE).strip() or "Not Found"
+def map_game(summary: dict[str, Any], detail: dict[str, Any], existing: dict[str, Any] | None, download_base: str) -> dict[str, Any]:
+    # The API slug is canonical and must not be normalized or changed.
+    slug = text(detail.get("slug") or summary.get("slug"))
+    categories = [category for category in unique_strings([
+        *as_list(detail.get("genres")),
+        *as_list(detail.get("tags")),
+        detail.get("category"),
+    ]) if category.casefold() != "lossless repack"]
+    repack_size = text(detail.get("repackSize")) or "Not Found"
+    repack_size = re.sub(r"\s*\[selective download\]\s*$", "", repack_size, flags=re.IGNORECASE).strip() or "Not Found"
     return {
         "id": (existing or {}).get("id") or deterministic_id(slug),
         "title": text(detail.get("title") or summary.get("title")),
         "slug": slug,
-        "categories": cats,
+        "categories": categories,
         "size_original": text(detail.get("originalSize")) or "Not Found",
-        "size_repack": rs,
+        "size_repack": repack_size,
         "description": description(detail),
-        "cover_url": text(detail.get("cover")) or (gog or {}).get("cover_url") or None,
-        "screenshots": unique_strings([*image_urls(detail.get("screenshots")), *((gog or {}).get("screenshots") or [])]),
-        "system_requirements": (gog or {}).get("system_requirements") or "Not Found",
+        "cover_url": text(detail.get("cover")) or None,
+        "screenshots": image_urls(detail.get("screenshots")),
+        "system_requirements": "Not Found",
         "repacker": "Fitgirl",
-        "download_url": f"{dl_base.rstrip('/')}/fg-{urllib.parse.quote(slug, safe='-')}",
+        "download_url": f"{download_base.rstrip('/')}/fg-{urllib.parse.quote(slug, safe='')}",
         "is_published": True,
         "featured": bool((existing or {}).get("featured", False)),
         "downloads_count": int((existing or {}).get("downloads_count", 0) or 0),
@@ -713,159 +221,287 @@ def map_game(
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CLI
-# ═══════════════════════════════════════════════════════════════════════════
+def github_file_url(owner: str, repo: str, path: str) -> str:
+    encoded = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/"))
+    return f"https://api.github.com/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/contents/{encoded}"
+
+
+def parse_json_bytes(raw: bytes, path: str) -> list[dict[str, Any]]:
+    if not raw.strip():
+        return []
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Invalid JSON in {path}: {error}") from error
+    games = data if isinstance(data, list) else data.get("games", []) if isinstance(data, dict) else None
+    if not isinstance(games, list):
+        raise RuntimeError(f"{path} must contain a JSON array or an object with a games array.")
+    return [game for game in games if isinstance(game, dict)]
+
+
+def clone_repository(owner: str, repo: str, branch: str) -> Path:
+    root = Path(tempfile.mkdtemp(prefix="repackx-fitgirl-"))
+    destination = root / "repo"
+    url = f"https://github.com/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}.git"
+    command = ["git", "clone", "--depth", "1", "--branch", branch, url, str(destination)]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=180)
+    except Exception:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    return destination
+
+
+def discover_game_files(repo_root: Path, data_path: str) -> list[tuple[int, str, Path]]:
+    data_dir = repo_root / Path(data_path).parent
+    if not data_dir.exists():
+        raise RuntimeError(f"Catalogue directory does not exist in cloned repository: {data_dir}")
+    files: list[tuple[int, str, Path]] = []
+    for path in data_dir.iterdir():
+        match = GAMES_RE.fullmatch(path.name)
+        if match and path.is_file():
+            index = int(match.group("index") or 0)
+            files.append((index, path.name, path))
+    if not files:
+        raise RuntimeError(f"No gamesN.json files found in {data_dir}")
+    return sorted(files, key=lambda item: item[0])
+
+
+def local_state_path() -> Path:
+    configured = os.environ.get("FITGIRL_STATE_PATH", "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        return path if path.is_absolute() else Path(__file__).resolve().parent / path
+    return Path(__file__).resolve().parent / ".fg_import_state.json"
+
+
+def read_state(file_path: Path) -> dict[str, Any]:
+    if not file_path.exists() or not file_path.read_bytes().strip():
+        return {"lastScannedPage": 1, "lastPage": 1}
+    try:
+        value = json.loads(file_path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {"lastScannedPage": 1, "lastPage": 1}
+    except json.JSONDecodeError:
+        print(f"Warning: invalid {file_path}; starting from page 1", file=sys.stderr)
+        return {"lastScannedPage": 1, "lastPage": 1}
+
+
+def write_state(file_path: Path, state: dict[str, Any]) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = file_path.with_suffix(file_path.suffix + ".tmp")
+    temporary.write_bytes(json_bytes(state))
+    temporary.replace(file_path)
+
+
+def api_last_page(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("lastPage", "last_page", "totalPages", "total_pages", "pages"):
+        value = payload.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    meta = payload.get("pagination") or payload.get("meta")
+    if isinstance(meta, dict):
+        for key in ("lastPage", "last_page", "totalPages", "total_pages", "pages"):
+            value = meta.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
+def result_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("results", "repacks", "data", "items"):
+            if isinstance(payload.get(key), list):
+                return [item for item in payload[key] if isinstance(item, dict)]
+    raise RuntimeError("Unexpected FitGirl /latest response: no results array found.")
+
+
+def read_github_file(owner: str, repo: str, branch: str, path: str, token: str) -> tuple[bytes, str | None]:
+    try:
+        payload, _ = api_json(github_file_url(owner, repo, path) + "?ref=" + urllib.parse.quote(branch), token=token)
+    except RuntimeError as error:
+        if str(error).startswith("HTTP 404"):
+            return b"", None
+        raise
+    content = base64.b64decode(str(payload.get("content", "")).replace("\n", ""))
+    return content, payload.get("sha")
+
+
+def write_github_file(owner: str, repo: str, branch: str, path: str, token: str, raw: bytes, sha: str | None, message: str) -> None:
+    if len(raw) > DEFAULT_MAX_BYTES:
+        raise RuntimeError(f"{path} is {len(raw) / 1024:.0f} KB; it exceeds the safe 900 KB file limit.")
+    payload: dict[str, Any] = {
+        "message": message,
+        "content": base64.b64encode(raw).decode("ascii"),
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+    api_json(github_file_url(owner, repo, path), token=token, method="PUT", payload=payload)
+
+
+def json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def choose_target(files: list[tuple[int, str, Path]], records_by_file: dict[str, list[dict[str, Any]]], new_game: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    for _, name, path in files:
+        records = records_by_file[name]
+        candidate = [*records, new_game]
+        if len(json_bytes(candidate)) <= DEFAULT_MAX_BYTES:
+            return name, candidate
+    next_index = max(index for index, _, _ in files) + 1
+    name = "games.json" if next_index == 0 else f"games{next_index}.json"
+    return name, [new_game]
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--limit", type=int, default=env_int("FITGIRL_IMPORT_LIMIT", 1))
-    p.add_argument("--delay", type=float, default=env_float("FITGIRL_IMPORT_DELAY", 0.25))
-    p.add_argument("--interval", type=float, default=env_float("FITGIRL_IMPORT_INTERVAL", 3600))
-    p.add_argument("--once", action="store_true", default=env_bool("FITGIRL_IMPORT_ONCE"))
-    p.add_argument("--dry-run", action="store_true", default=env_bool("FITGIRL_IMPORT_DRY_RUN"))
-    p.add_argument("--force", action="store_true", default=env_bool("FITGIRL_IMPORT_FORCE"))
-    p.add_argument("--health-port", type=int, default=env_int("HEALTH_PORT", DEFAULT_HEALTH_PORT))
-    p.add_argument("--health-host", type=str, default=env("HEALTH_HOST", DEFAULT_HEALTH_HOST))
-    return p.parse_args()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  CORE IMPORT CYCLE
-# ═══════════════════════════════════════════════════════════════════════════
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--interval", type=float, default=env_float("FITGIRL_IMPORT_INTERVAL", 3600))
+    parser.add_argument("--delay", type=float, default=env_float("FITGIRL_IMPORT_DELAY", 0.25))
+    parser.add_argument("--limit", type=int, default=env_int("FITGIRL_IMPORT_LIMIT", 1))
+    parser.add_argument("--once", action="store_true", default=env_bool("FITGIRL_IMPORT_ONCE"))
+    parser.add_argument("--dry-run", action="store_true", default=env_bool("FITGIRL_IMPORT_DRY_RUN"))
+    return parser.parse_args()
 
 
 def run_cycle(args: argparse.Namespace) -> int:
-    fg_base = env("FITGIRL_API_BASE_URL", DEFAULT_FITGIRL_API).rstrip("/")
-    dl_base = env("REPACK_X_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE)
     owner = env("GITHUB_REPO_OWNER", "LittleHacker999")
     repo = env("GITHUB_REPO_NAME", "musical-guacamole")
     branch = env("GITHUB_REPO_BRANCH", "main")
-    data_dir = env("GITHUB_DATA_DIR", DEFAULT_DATA_DIR)
+    data_path = env("GITHUB_DATA_PATH", "data/games.json")
+    state_file = local_state_path()
+    fitgirl_base = env("FITGIRL_API_BASE_URL", DEFAULT_FITGIRL_API).rstrip("/")
+    download_base = env("REPACK_X_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE)
     token = os.environ.get("GITHUB_CONTENTS_TOKEN", "").strip()
-    fetch_gog = env_bool("FITGIRL_FETCH_GOG", True)
-    gog_delay = env_float("GOG_IMPORT_DELAY", DEFAULT_GOG_DELAY)
+    if not args.dry_run and not token:
+        raise RuntimeError("GITHUB_CONTENTS_TOKEN is required unless --dry-run is used.")
 
-    if not token:
-        raise RuntimeError("GITHUB_CONTENTS_TOKEN is required.")
+    clone_root = clone_repository(owner, repo, branch)
+    try:
+        files = discover_game_files(clone_root, data_path)
+        state = read_state(state_file)
+        last_scanned = max(1, int(state.get("lastScannedPage", state.get("last_scanned_page", 1)) or 1))
+        saved_last_page = max(1, int(state.get("lastPage", state.get("last_page", 1)) or 1))
+        current_page = last_scanned + 1 if last_scanned < saved_last_page else 1
 
-    print(f"\n{'=' * 60}")
-    print(f"CYCLE START at {datetime.now(timezone.utc).isoformat()}")
-    print(f"{'=' * 60}")
+        records_by_file: dict[str, list[dict[str, Any]]] = {}
+        by_slug: dict[str, dict[str, Any]] = {}
+        for _, name, path in files:
+            records = parse_json_bytes(path.read_bytes(), str(path))
+            records_by_file[name] = records
+            for game in records:
+                slug = text(game.get("slug"))
+                if slug:
+                    by_slug[slug] = game
 
-    # ── 1. DISCOVER files: How many gamesN.json exist in data/? ────────
-    existing, file_info = read_catalogue(owner, repo, branch, data_dir)
-    file_names = [fi["name"] for fi in file_info.values()]
-    STATUS.update_files(file_names, len(existing))
+        page_payloads: dict[int, Any] = {}
+        page_order = [current_page] if current_page == 1 else [current_page, 1]
+        for page in page_order:
+            if page in page_payloads:
+                continue
+            payload = get_with_retries(f"{fitgirl_base}/latest?page={page}")
+            page_payloads[page] = payload
 
-    by_slug = {text(g.get("slug")): g for g in existing if text(g.get("slug"))}
-    imported: list[dict[str, Any]] = []
-    cycle_limit = args.limit if (args.dry_run or args.once) else 1
+        latest_payload = page_payloads.get(current_page) or page_payloads[1]
+        last_page = api_last_page(latest_payload) or saved_last_page
+        imported: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for page in page_order:
+            for summary in result_items(page_payloads[page]):
+                if should_skip(summary):
+                    continue
+                slug = text(summary.get("slug"))
+                if not slug or slug in seen:
+                    continue
+                seen.add(slug)
+                if slug in by_slug:
+                    print(f"skip existing: {slug}")
+                    continue
+                detail = get_with_retries(f"{fitgirl_base}/repack/{urllib.parse.quote(slug, safe='')}")
+                if not isinstance(detail, dict) or should_skip(detail):
+                    continue
+                exact_slug = text(detail.get("slug") or slug)
+                if not exact_slug or exact_slug in by_slug:
+                    print(f"skip existing exact slug: {exact_slug or slug}")
+                    continue
+                if not has_download_links(detail):
+                    print(f"skip without download links: {exact_slug}")
+                    continue
+                game = map_game(summary, detail, None, download_base)
+                imported.append(game)
+                by_slug[exact_slug] = game
+                print(f"import: {game['title']} -> {game['download_url']}")
+                if len(imported) >= args.limit:
+                    break
+                time.sleep(max(0, args.delay))
+            if len(imported) >= args.limit:
+                break
 
-    # ── 2. Fetch ONLY page 1 from FitGirl ─────────────────────────────
-    page = get_with_retries(f"{fg_base}/latest?page=1")
-    results = page.get("results", []) if isinstance(page, dict) else page
-    if not isinstance(results, list):
-        raise RuntimeError("Unexpected /latest response.")
+        if not imported:
+            print(f"No new FitGirl releases found. scanned_page={current_page} last_page={last_page}")
+        elif args.dry_run:
+            print(json.dumps(imported, ensure_ascii=False, indent=2))
+        else:
+            changed_files: dict[str, tuple[bytes, str | None]] = {}
+            for game in imported:
+                target, candidate = choose_target(files, records_by_file, game)
+                records_by_file[target] = candidate
+                files = [(index, name, path) for index, name, path in files if name != target] + [
+                    (int(GAMES_RE.fullmatch(target).group("index") or 0), target, clone_root / Path(data_path).parent / target)
+                ]
+                files.sort(key=lambda item: item[0])
+                changed_files[target] = (json_bytes(candidate), None)
+                print(f"write: {target} ({len(candidate)} games)")
 
-    print(f"[scan] FitGirl page 1: {len(results)} result(s), checking for new...")
+            for name, (raw, _) in changed_files.items():
+                target_path = str(Path(data_path).parent / name)
+                _, sha = read_github_file(owner, repo, branch, target_path, token)
+                write_github_file(owner, repo, branch, target_path, token, raw, sha, f"Import {len(imported)} FitGirl release(s) into {name}")
 
-    # ── 3. Check each game ─────────────────────────────────────────────
-    for summary in results:
-        if not isinstance(summary, dict) or should_skip(summary):
-            continue
-        slug = clean_slug(summary.get("slug"))
-        if not slug:
-            continue
-        if not args.force and slug in by_slug:
-            print(f"  skip existing: {slug}")
-            continue
-
-        detail = get_with_retries(f"{fg_base}/repack/{urllib.parse.quote(slug, safe='-')}")
-        if not isinstance(detail, dict) or should_skip(detail):
-            continue
-        if not has_download_links(detail):
-            print(f"  skip no links: {slug}")
-            continue
-
-        gog = fetch_gog_metadata(text(detail.get("title") or summary.get("title")), gog_delay) if fetch_gog else {}
-        game = map_game(summary, detail, by_slug.get(slug), dl_base, gog)
-        imported.append(game)
-        by_slug[slug] = game
-        print(f"  ★ NEW: {game['title']} -> {game['download_url']}")
-
-        if len(imported) >= cycle_limit:
-            break
-        time.sleep(max(0, args.delay))
-
-    # ── 4. No new ──────────────────────────────────────────────────────
-    if not imported:
-        print("No new games on page 1.")
-        STATUS.update_cycle("no new releases")
-        return 0
-
-    # ── 5. Dry run ─────────────────────────────────────────────────────
-    if args.dry_run:
-        print(json.dumps(imported, ensure_ascii=False, indent=2))
-        print(f"Dry run: {len(imported)} mapped. GitHub unchanged.")
-        STATUS.update_cycle(f"dry run: {len(imported)}")
-        return 0
-
-    # ── 6. Merge and write ─────────────────────────────────────────────
-    merged = [
-        g for g in existing
-        if text(g.get("slug")) not in {item["slug"] for item in imported}
-    ]
-    merged.extend(imported)
-    merged.sort(key=lambda g: g.get("created_at", ""), reverse=True)
-
-    write_catalogue(owner, repo, branch, data_dir, merged, file_info,
-                    f"Import {len(imported)} FitGirl release(s)")
-
-    print(f"Updated: {len(imported)} new, {len(merged)} total.")
-    STATUS.increment_imported(len(imported))
-    STATUS.update_cycle(f"imported {len(imported)} release(s)")
-    return 0
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════
+        next_page = current_page if current_page >= last_page else current_page
+        new_state = {
+            "lastScannedPage": next_page,
+            "lastPage": last_page,
+            "lastCycleAt": datetime.now(timezone.utc).isoformat(),
+            "lastImportedSlugs": [game["slug"] for game in imported],
+        }
+        if not args.dry_run:
+            write_state(state_file, new_state)
+            print(f"Local import state updated: {state_file}")
+        else:
+            print(json.dumps(new_state, indent=2))
+        return len(imported)
+    finally:
+        shutil.rmtree(clone_root.parent, ignore_errors=True)
 
 
 def main() -> int:
     args = parse_args()
-    if args.limit < 1 or args.interval < 1:
-        raise RuntimeError("--limit and --interval must be positive.")
-
-    try:
-        start_health_server(args.health_host, args.health_port)
-    except OSError as e:
-        print(f"[health] error: {e}", file=sys.stderr)
-
-    if args.dry_run or args.once:
+    if args.interval < 1 or args.delay < 0 or args.limit < 1:
+        raise RuntimeError("interval and limit must be positive; delay cannot be negative")
+    if args.once or args.dry_run:
         return run_cycle(args)
-
-    print("Continuous mode: 1 new game per hour from page 1.")
+    print("Continuous FitGirl import mode started.")
     while True:
-        t0 = time.monotonic()
+        started = time.monotonic()
         try:
             run_cycle(args)
-        except Exception as e:
-            print(f"Cycle failed: {e}", file=sys.stderr)
-            STATUS.update_cycle("failed", error=str(e))
-        wait = max(1, args.interval - (time.monotonic() - t0))
-        print(f"Next check in {wait:.0f}s.", flush=True)
-        time.sleep(wait)
+        except Exception as error:
+            print(f"Cycle failed: {error}", file=sys.stderr)
+        wait_seconds = max(1, args.interval - (time.monotonic() - started))
+        print(f"Next cycle in {wait_seconds:.0f} seconds.", flush=True)
+        time.sleep(wait_seconds)
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
         raise SystemExit(130)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+    except Exception as error:
+        print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(1)
