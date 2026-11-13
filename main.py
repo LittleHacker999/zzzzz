@@ -457,7 +457,7 @@ def map_to_api_payload(summary: dict[str, Any], detail: dict[str, Any]) -> dict[
     return {
         "title": title,
         "slug": slug,
-        "download_url": f"https://fitgirl-repacks.site/{slug}/",
+        "download_url": f"https://repack-x-database.vercel.app/fg-{slug}",
         "repacker": "Fitgirl",
         "size_original": size_original,
         "size_repack": size_repack,
