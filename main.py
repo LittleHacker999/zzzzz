@@ -15,7 +15,7 @@ Health web server (started in every mode):
 
 Environment variables:
   REPACK_X_ADMIN_SECRET     (required) Admin secret for POST /api/games/admin
-  REPACK_X_SITE_URL         default https://repackx.vercel.app
+  REPACK_X_SITE_URL         default https://ideal-selie-bitx-862206ac.apps.mistral.run/
   FITGIRL_API_BASE_URL      default https://fitgirl-api-5rbz.onrender.com
   FITGIRL_IMPORT_LIMIT      default 5      (max games imported per cycle)
   FITGIRL_PAGES_PER_CYCLE   default 5      (backfill pages scanned per cycle)
@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 DEFAULT_FITGIRL_API = "https://fitgirl-api-5rbz.onrender.com"
-DEFAULT_SITE_URL = "https://repackx.vercel.app"
+DEFAULT_SITE_URL = "https://ideal-selie-bitx-862206ac.apps.mistral.run/"
 IMAGE_URL_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)(?:[?#].*)?$", re.IGNORECASE)
 SKIP_RE = re.compile(r"(?:upcoming[- ]repacks?|updates?[- ]digest|digest[- ]updates?)", re.IGNORECASE)
 
