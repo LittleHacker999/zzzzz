@@ -3,14 +3,14 @@
 
 Every 1 hour:
   1. FitGirl: Check /latest?page=1 → add new releases (FitGirl data only, NO RAWG/GOG).
-     Title: "[Game Name] (Fitgirl Repack)"  Slug: "fg-{slug}"
+     Title: "[Game Name] (Fitgirl Repack)"  Slug: "{slug}" (normal, no prefix)
   2. GOG: Pick games from GOG scrape /api/all-games → enrich with RAWG
-     (description/tags/screenshots) + GOG official API (system requirements) → add.
+     (description/screenshots) + GOG Catalog API (genres/tags/cover) +
+     GOG official API (system requirements) → add.
      Title: "[Game Name] (GOG Repack)"  Slug: "gog-{slug}"
-     Cover: coverVertical from GOG Catalog API
   3. If GOG game already on site as FitGirl → rename FitGirl title to
      "[Game Name] (Fitgirl Repack)" and add GOG entry anyway.
-  4. When GOG backlog is complete, only new GOG games are checked (same as FitGirl).
+  4. When GOG backlog is complete, only new GOG games are checked.
 
 Download URLs:
   FitGirl: https://repack-x-database.vercel.app/fg-{slug}
@@ -65,10 +65,9 @@ DEFAULT_RAWG_API = "https://api.rawg.io"
 DEFAULT_GOG_SCRAPE_API = "https://repackx-gscrape.onrender.com"
 DEFAULT_GOG_SCRAPE_KEY = "@Jithula2009"
 GOG_V2_API = "https://api.gog.com/v2/games"
+GOG_CATALOG_API = "https://catalog.gog.com/v1/catalog"
 
-IMAGE_URL_RE = re.compile(
-    r"\.(?:jpe?g|png|webp|gif|avif)(?:[?#].*)?$", re.I
-)
+IMAGE_URL_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)(?:[?#].*)?$", re.I)
 SKIP_RE = re.compile(
     r"(?:upcoming[- ]repacks?|updates?[- ]digest|digest[- ]updates?)", re.I
 )
@@ -187,7 +186,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self._send(
                 200,
                 _HTML
-                + f"<h1>Repack X Importer</h1>"
+                + "<h1>Repack X Importer</h1>"
                 + "<p class='ok'>&#9679; working: true</p>"
                 + f"<table>{rows}</table>"
                 + "<p><a href='/api/health'>/api/health</a> &middot; "
@@ -210,13 +209,7 @@ def start_health_server(host, port):
 # ── HTTP helpers ──────────────────────────────────────────────────────────
 
 def _request_json(
-    url,
-    *,
-    method="GET",
-    payload=None,
-    headers=None,
-    timeout=60,
-    retries=3,
+    url, *, method="GET", payload=None, headers=None, timeout=60, retries=3
 ):
     last = None
     for attempt in range(retries):
@@ -254,15 +247,11 @@ def get_json(url, **kw):
 
 
 def post_json(url, payload, headers=None, **kw):
-    return _request_json(
-        url, method="POST", payload=payload, headers=headers, **kw
-    )
+    return _request_json(url, method="POST", payload=payload, headers=headers, **kw)
 
 
 def patch_json(url, payload, headers=None, **kw):
-    return _request_json(
-        url, method="PATCH", payload=payload, headers=headers, **kw
-    )
+    return _request_json(url, method="PATCH", payload=payload, headers=headers, **kw)
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────
@@ -305,11 +294,7 @@ def nested_urls(v):
 def image_urls(v) -> list[str]:
     out, seen = [], set()
     for u in nested_urls(v):
-        if (
-            re.match(r"^https?://", u, re.I)
-            and IMAGE_URL_RE.search(u)
-            and u not in seen
-        ):
+        if re.match(r"^https?://", u, re.I) and IMAGE_URL_RE.search(u) and u not in seen:
             seen.add(u)
             out.append(u)
     return out
@@ -318,27 +303,39 @@ def image_urls(v) -> list[str]:
 def clean_html(raw: str) -> str:
     t = re.sub(r"<[^>]+>", "", raw)
     for a, b in [
-        ("&#39;", "'"),
-        ("&nbsp;", " "),
-        ("&amp;", "&"),
-        ("&lt;", "<"),
-        ("&gt;", ">"),
-        ("&quot;", '"'),
-        ("&rsquo;", "\u2019"),
-        ("&lsquo;", "\u2018"),
-        ("&rdquo;", "\u201d"),
-        ("&ldquo;", "\u201c"),
-        ("&mdash;", "\u2014"),
-        ("&ndash;", "\u2013"),
+        ("&#39;", "'"), ("&nbsp;", " "), ("&amp;", "&"),
+        ("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'),
+        ("&rsquo;", "\u2019"), ("&lsquo;", "\u2018"),
+        ("&rdquo;", "\u201d"), ("&ldquo;", "\u201c"),
+        ("&mdash;", "\u2014"), ("&ndash;", "\u2013"),
     ]:
         t = t.replace(a, b)
     return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
-# ── Slug matching ─────────────────────────────────────────────────────────
+# ── Title cleaning ────────────────────────────────────────────────────────
+
+def clean_game_title(title: str) -> str:
+    """Clean game title: >observer_ → Observer, Call of Duty® → Call of Duty."""
+    t = title.strip()
+    # Remove trademark/copyright symbols everywhere
+    t = re.sub(r"[™®©]", "", t)
+    # Remove leading special characters like >, <, !, ~
+    t = re.sub(r"^[><!~\s]+", "", t)
+    # Remove trailing underscores, tildes, spaces
+    t = re.sub(r"[_~\s]+$", "", t)
+    # Replace remaining underscores with spaces
+    t = t.replace("_", " ")
+    # Collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    # Capitalize first letter
+    if t and t[0].islower():
+        t = t[0].upper() + t[1:]
+    return t
+
 
 def normalize_slug_for_match(slug: str) -> str:
-    """Normalize GOG slug (underscores) to hyphen format for matching."""
+    """GOG slug (underscores) → hyphen format for matching FitGirl."""
     return slug.replace("_", "-").lower().strip("-")
 
 
@@ -363,18 +360,14 @@ def fg_has_downloads(detail: dict) -> bool:
                 yield from walk(i)
 
     fields = (
-        detail.get("downloadMirrors"),
-        detail.get("torrents"),
-        detail.get("magnets"),
-        detail.get("mirrors"),
-        detail.get("downloads"),
-        detail.get("downloadLinks"),
+        detail.get("downloadMirrors"), detail.get("torrents"),
+        detail.get("magnets"), detail.get("mirrors"),
+        detail.get("downloads"), detail.get("downloadLinks"),
         detail.get("download_links"),
     )
     return any(
         re.match(r"^(?:https?://|magnet:\?)", v, re.I)
-        for f in fields
-        for v in walk(f)
+        for f in fields for v in walk(f)
     )
 
 
@@ -403,12 +396,11 @@ def fg_description(detail: dict) -> str:
     return "\n\n".join(parts)
 
 
-# ── RAWG enrichment (for GOG games ONLY) ─────────────────────────────────
+# ── RAWG enrichment (for GOG games ONLY — description + screenshots) ─────
 
 def rawg_enrich(title: str, rawg_base: str, rawg_key: str) -> dict:
-    """Search RAWG by title → description, tags, screenshots, cover.
-    Uses 2 requests: search + detail. Minimal to respect rate limits."""
-    result = {"description": "", "tags": [], "screenshots": [], "cover": ""}
+    """Search RAWG by title → description + screenshots only (NO tags)."""
+    result = {"description": "", "screenshots": [], "cover": ""}
 
     q = urllib.parse.urlencode(
         {"search": title, **({"key": rawg_key} if rawg_key else {})}
@@ -426,11 +418,6 @@ def rawg_enrich(title: str, rawg_base: str, rawg_key: str) -> dict:
 
     g = games[0]
     result["cover"] = g.get("background_image", "")
-    result["tags"] = [
-        t.get("name", "")
-        for t in g.get("tags", [])
-        if isinstance(t, dict) and t.get("name")
-    ][:12]
     result["screenshots"] = [
         s.get("image", "")
         for s in g.get("short_screenshots", [])
@@ -447,20 +434,63 @@ def rawg_enrich(title: str, rawg_base: str, rawg_key: str) -> dict:
             )
             STATUS.bump("rawg_calls")
             result["description"] = clean_html(detail.get("description_raw", ""))
-            for t in detail.get("tags", []):
-                n = t.get("name", "") if isinstance(t, dict) else ""
-                if n and n not in result["tags"]:
-                    result["tags"].append(n)
         except RuntimeError:
             pass
 
     return result
 
 
-# ── GOG official API (for GOG games ONLY) ────────────────────────────────
+# ── GOG Catalog API (genres + tags + coverVertical for GOG games) ───────
+
+def get_gog_catalog_info(
+    title: str, gog_scrape_base: str, gog_scrape_key: str
+) -> dict:
+    """Get coverVertical, genres, tags from GOG Catalog API.
+    Categories come ONLY from here (not RAWG)."""
+    result = {"cover_vertical": "", "genres": [], "tags": []}
+
+    # Primary: direct GOG Catalog API
+    try:
+        q = urllib.parse.urlencode({"query": title, "limit": 1})
+        data = get_json(f"{GOG_CATALOG_API}?{q}", retries=2)
+        STATUS.bump("gog_api_calls")
+        products = data.get("products", []) if isinstance(data, dict) else []
+        if products:
+            p = products[0]
+            result["cover_vertical"] = (
+                p.get("coverVertical", "") or p.get("cover", "")
+            )
+            result["genres"] = unique_strings(as_list(p.get("genres")))
+            result["tags"] = unique_strings(as_list(p.get("tags")))
+    except RuntimeError as e:
+        print(f"  ⚠  GOG Catalog API failed: {e}")
+
+    # Fallback: GOG scrape API for cover only
+    if not result["cover_vertical"]:
+        try:
+            q = urllib.parse.urlencode({"q": title, "limit": 1})
+            headers = {"X-API-Key": gog_scrape_key} if gog_scrape_key else {}
+            data = get_json(
+                f"{gog_scrape_base}/api/catalog?{q}",
+                headers=headers,
+                retries=2,
+            )
+            STATUS.bump("gog_api_calls")
+            results = data.get("results", []) if isinstance(data, dict) else []
+            if results:
+                r = results[0]
+                result["cover_vertical"] = (
+                    r.get("coverVertical", "") or r.get("cover", "")
+                )
+        except RuntimeError:
+            pass
+
+    return result
+
+
+# ── GOG official API (system requirements) ───────────────────────────────
 
 def gog_sysreqs(gog_id) -> str:
-    """Fetch system requirements from api.gog.com/v2/games/{id}."""
     try:
         data = get_json(f"{GOG_V2_API}/{gog_id}", retries=2)
         STATUS.bump("gog_api_calls")
@@ -506,46 +536,10 @@ def _extract_sysreqs(data) -> str:
 # ── GOG scrape API ───────────────────────────────────────────────────────
 
 def gog_all_games(base: str, key: str) -> list[dict]:
-    """GET /api/all-games from the GOG scrape API."""
     headers = {"X-API-Key": key} if key else {}
     STATUS.bump("gog_api_calls")
     data = get_json(f"{base}/api/all-games", headers=headers, retries=3)
     return data.get("games", []) if isinstance(data, dict) else []
-
-
-def get_gog_cover_vertical(
-    title: str, gog_scrape_base: str, gog_scrape_key: str
-) -> str:
-    """Get coverVertical image from GOG Catalog API."""
-    # Try GOG scrape API catalog first
-    try:
-        q = urllib.parse.urlencode({"q": title, "limit": 1})
-        headers = {"X-API-Key": gog_scrape_key} if gog_scrape_key else {}
-        data = get_json(
-            f"{gog_scrape_base}/api/catalog?{q}", headers=headers, retries=2
-        )
-        STATUS.bump("gog_api_calls")
-        results = data.get("results", []) if isinstance(data, dict) else []
-        if results:
-            r = results[0]
-            return r.get("coverVertical", "") or r.get("cover", "")
-    except RuntimeError as e:
-        print(f"  ⚠  GOG scrape catalog cover failed: {e}")
-
-    # Fallback: direct GOG Catalog API
-    try:
-        q = urllib.parse.urlencode({"query": title, "limit": 1})
-        data = get_json(
-            f"https://catalog.gog.com/v1/catalog?{q}", retries=2
-        )
-        STATUS.bump("gog_api_calls")
-        products = data.get("products", []) if isinstance(data, dict) else []
-        if products:
-            p = products[0]
-            return p.get("coverVertical", "") or p.get("cover", "")
-    except RuntimeError:
-        pass
-    return ""
 
 
 # ── Repack X API ─────────────────────────────────────────────────────────
@@ -575,7 +569,6 @@ def fetch_existing_slugs(site_url: str) -> set[str]:
 
 
 def create_game(site_url: str, secret: str, payload: dict) -> Any:
-    """Send secret via header, body, AND query param — max compatibility."""
     full_payload = {**payload, "secret": secret}
     headers = {
         "x-admin-secret": secret,
@@ -586,7 +579,6 @@ def create_game(site_url: str, secret: str, payload: dict) -> Any:
 
 
 def get_site_game_by_slug(site_url: str, slug: str) -> dict | None:
-    """Get game details from the site by slug."""
     try:
         data = get_json(
             f"{site_url}/api/games/{urllib.parse.quote(slug, safe='')}",
@@ -602,16 +594,9 @@ def get_site_game_by_slug(site_url: str, slug: str) -> dict | None:
 def rename_game_title(
     site_url: str, secret: str, game_id: str, new_title: str
 ) -> None:
-    """Rename an existing game's title via PATCH."""
     url = f"{site_url}/api/games/admin/{game_id}"
     headers = {"x-admin-secret": secret, "Authorization": f"Bearer {secret}"}
-    patch_json(
-        url,
-        {"title": new_title},
-        headers=headers,
-        timeout=30,
-        retries=1,
-    )
+    patch_json(url, {"title": new_title}, headers=headers, timeout=30, retries=1)
 
 
 # ── Payload builders ─────────────────────────────────────────────────────
@@ -619,9 +604,11 @@ def rename_game_title(
 def build_fitgirl_payload(
     summary: dict, detail: dict, download_base: str
 ) -> dict:
-    """FitGirl game — FitGirl data ONLY. No RAWG, no GOG."""
+    """FitGirl game — FitGirl data ONLY.
+    Title: "[Name] (Fitgirl Repack)"  Slug: plain (no prefix)
+    Download: /fg-{slug}"""
     slug = text(detail.get("slug") or summary.get("slug"))
-    title = text(detail.get("title") or summary.get("title"))
+    title = clean_game_title(text(detail.get("title") or summary.get("title")))
 
     categories = [
         c
@@ -642,15 +629,13 @@ def build_fitgirl_payload(
     size_orig = text(detail.get("originalSize")) or "Not Found"
     size_repack = text(detail.get("repackSize")) or "Not Found"
     size_repack = (
-        re.sub(
-            r"\s*\[Selective Download\]\s*$", "", size_repack, flags=re.I
-        ).strip()
+        re.sub(r"\s*\[Selective Download\]\s*$", "", size_repack, flags=re.I).strip()
         or "Not Found"
     )
 
     return {
         "title": f"{title} (Fitgirl Repack)",
-        "slug": f"fg-{slug}",
+        "slug": slug,
         "download_url": f"{download_base}/fg-{slug}",
         "repacker": "Fitgirl",
         "size_original": size_orig,
@@ -671,17 +656,20 @@ def build_gog_payload(
     rawg: dict,
     sysreq: str,
     download_base: str,
-    cover_vertical: str,
+    catalog_info: dict,
 ) -> dict:
-    """GOG game — RAWG desc/tags/shots + GOG v2 sysreqs + coverVertical cover."""
+    """GOG game — RAWG desc/shots + GOG Catalog genres/tags/cover + GOG v2 sysreqs.
+    Title: "[Name] (GOG Repack)"  Slug: "gog-{slug}"
+    Download: /gog-{id}"""
     gog_id = gog_game.get("id", 0)
-    title = text(gog_game.get("title"))
+    title = clean_game_title(text(gog_game.get("title")))
     slug = text(gog_game.get("slug"))
 
+    # Categories ONLY from GOG Catalog API (genres + tags)
     categories = unique_strings(
         [
-            gog_game.get("category"),
-            *rawg.get("tags", []),
+            *catalog_info.get("genres", []),
+            *catalog_info.get("tags", []),
         ]
     )[:15]
 
@@ -694,7 +682,7 @@ def build_gog_payload(
         "size_repack": "Not Found",
         "categories": categories,
         "description": rawg.get("description", "") or "Not Found",
-        "cover_url": cover_vertical or rawg.get("cover", ""),
+        "cover_url": catalog_info.get("cover_vertical", "") or rawg.get("cover", ""),
         "screenshot_urls": rawg.get("screenshots", []),
         "system_requirements": sysreq or "Not Found",
         "is_published": True,
@@ -708,9 +696,7 @@ def build_gog_payload(
 def run_cycle(args) -> int:
     fitgirl_base = env("FITGIRL_API_BASE_URL", DEFAULT_FITGIRL_API).rstrip("/")
     site_url = env("REPACK_X_SITE_URL", DEFAULT_SITE_URL).rstrip("/")
-    download_base = env("REPACK_X_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE).rstrip(
-        "/"
-    )
+    download_base = env("REPACK_X_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE).rstrip("/")
     admin_secret = env("REPACK_X_ADMIN_SECRET", "") or env("ADMIN_SECRET", "")
     rawg_base = env("RAWG_API_BASE_URL", DEFAULT_RAWG_API).rstrip("/")
     rawg_key = env("RAWG_API_KEY", "")
@@ -741,8 +727,8 @@ def run_cycle(args) -> int:
     delay = max(0.0, args.delay)
 
     # ═══════════════════════════════════════════════════════════════════
-    # 2) FITGIRL — page 1 only, add new releases (NO RAWG / NO GOG)
-    #    Title: "[Game Name] (Fitgirl Repack)"  Slug: "fg-{slug}"
+    # 2) FITGIRL — page 1 only (NO RAWG / NO GOG)
+    #    Title: "[Name] (Fitgirl Repack)"  Slug: plain (no fg- prefix)
     # ═══════════════════════════════════════════════════════════════════
     print("\n── FITGIRL: checking page 1 for new releases ──")
     try:
@@ -762,14 +748,12 @@ def run_cycle(args) -> int:
         slug = text(summary.get("slug"))
         if not slug:
             continue
-        fg_slug = f"fg-{slug}"
-        if fg_slug in existing:
+        # Check plain slug AND old fg- prefixed slug for duplicates
+        if slug in existing or f"fg-{slug}" in existing:
             continue
 
-        title = text(summary.get("title")) or slug
-        print(
-            f"\n  ⬇  [FITGIRL] {title} ({fg_slug}) — new, fetching detail…"
-        )
+        title = clean_game_title(text(summary.get("title"))) or slug
+        print(f"\n  ⬇  [FITGIRL] {title} ({slug}) — new, fetching detail…")
 
         try:
             detail = get_json(
@@ -782,11 +766,10 @@ def run_cycle(args) -> int:
         if not isinstance(detail, dict) or fg_should_skip(detail):
             continue
         exact_slug = text(detail.get("slug") or slug)
-        fg_exact = f"fg-{exact_slug}"
-        if fg_exact in existing:
+        if exact_slug in existing or f"fg-{exact_slug}" in existing:
             continue
         if not fg_has_downloads(detail):
-            print(f"  ⏭  {fg_exact} — no download links")
+            print(f"  ⏭  {exact_slug} — no download links")
             continue
 
         payload = build_fitgirl_payload(summary, detail, download_base)
@@ -797,34 +780,29 @@ def run_cycle(args) -> int:
                 f"| dl={payload['download_url']}"
             )
             fitgirl_new += 1
-            existing.add(fg_exact)
+            existing.add(exact_slug)
             continue
 
         try:
             create_game(site_url, admin_secret, payload)
-            existing.add(fg_exact)
+            existing.add(exact_slug)
             fitgirl_new += 1
-            print(
-                f"  ✅ [FITGIRL] {payload['title']} → {payload['download_url']}"
-            )
+            print(f"  ✅ [FITGIRL] {payload['title']} → {payload['download_url']}")
         except RuntimeError as e:
             err = str(e)
-            if (
-                "409" in err
-                or "exists" in err.lower()
-                or "duplicate" in err.lower()
-            ):
-                existing.add(fg_exact)
-                print(f"  ⏭  {fg_exact} — already on site")
+            if "409" in err or "exists" in err.lower() or "duplicate" in err.lower():
+                existing.add(exact_slug)
+                print(f"  ⏭  {exact_slug} — already on site")
             else:
                 print(f"  ⚠  create failed: {e}")
         time.sleep(delay)
 
     # ═══════════════════════════════════════════════════════════════════
-    # 3) GOG — pick games from all-games
-    #    Title: "[Game Name] (GOG Repack)"  Slug: "gog-{slug}"
+    # 3) GOG — all-games list
+    #    Title: "[Name] (GOG Repack)"  Slug: "gog-{slug}"
     #    Cover: coverVertical from GOG Catalog API
-    #    If already on site as FitGirl → rename FitGirl + add GOG
+    #    Categories: genres + tags from GOG Catalog API ONLY
+    #    If already on site as FitGirl → rename + add GOG
     # ═══════════════════════════════════════════════════════════════════
     print(f"\n── GOG: importing from all-games (limit: {args.gog_limit}) ──")
     try:
@@ -840,7 +818,8 @@ def run_cycle(args) -> int:
 
         gog_slug = text(gg.get("slug"))
         gog_id = gg.get("id")
-        gog_title = text(gg.get("title"))
+        gog_title_raw = text(gg.get("title"))
+        gog_title = clean_game_title(gog_title_raw)
 
         if not gog_slug or not gog_id:
             continue
@@ -850,54 +829,53 @@ def run_cycle(args) -> int:
         if gog_site_slug in existing:
             continue
 
-        # Check if already on site as FitGirl (by normalized slug match)
+        # Check if already on site as FitGirl (normalized slug match)
         normalized = normalize_slug_for_match(gog_slug)
-        fg_site_slug = f"fg-{normalized}"
         needs_rename = False
         fg_game_id = None
+        fg_site_slug = ""
 
-        if fg_site_slug in existing:
-            needs_rename = True
-            fg_game = get_site_game_by_slug(site_url, fg_site_slug)
-            if fg_game:
-                fg_game_id = fg_game.get("id")
+        for check in [normalized, f"fg-{normalized}"]:
+            if check in existing:
+                needs_rename = True
+                fg_site_slug = check
+                fg_game = get_site_game_by_slug(site_url, check)
+                if fg_game:
+                    fg_game_id = fg_game.get("id")
+                break
+
+        if needs_rename:
             print(
                 f"\n  🔄 [GOG] {gog_title} — already on site as "
                 f"FitGirl ({fg_site_slug})"
             )
 
-        print(
-            f"\n  ⬇  [GOG] {gog_title} (id={gog_id}, slug={gog_site_slug})"
-        )
+        print(f"\n  ⬇  [GOG] {gog_title} (id={gog_id}, slug={gog_site_slug})")
 
-        # Get coverVertical from GOG Catalog API
-        cover_vert = get_gog_cover_vertical(
-            gog_title, gog_base, gog_key
-        )
+        # GOG Catalog API — coverVertical + genres + tags
+        catalog_info = get_gog_catalog_info(gog_title, gog_base, gog_key)
         time.sleep(delay)
 
-        # RAWG enrichment (2 requests: search + detail)
+        # RAWG — description + screenshots only (NO tags)
         rawg = rawg_enrich(gog_title, rawg_base, rawg_key)
         time.sleep(delay)
 
-        # GOG official API — system requirements (1 request)
+        # GOG official API — system requirements
         sysreq = gog_sysreqs(gog_id)
         time.sleep(delay)
 
         # Build payload
-        payload = build_gog_payload(
-            gg, rawg, sysreq, download_base, cover_vert
-        )
+        payload = build_gog_payload(gg, rawg, sysreq, download_base, catalog_info)
 
         if args.dry_run:
             print(
                 f"  🔍 [dry-run] {payload['title']} "
-                f"| slug={payload['slug']} "
-                f"| dl={payload['download_url']}"
+                f"| slug={payload['slug']} | dl={payload['download_url']}"
             )
             print(
                 f"     cover={payload['cover_url'][:70]}  "
-                f"shots={len(payload['screenshot_urls'])}"
+                f"shots={len(payload['screenshot_urls'])}  "
+                f"cats={payload['categories']}"
             )
             if needs_rename:
                 print(
@@ -922,25 +900,17 @@ def run_cycle(args) -> int:
                     f"'{gog_title} (Fitgirl Repack)'"
                 )
             except RuntimeError as e:
-                print(
-                    f"  ⚠  rename failed (continuing with GOG add): {e}"
-                )
+                print(f"  ⚠  rename failed (continuing with GOG add): {e}")
 
         # Create GOG game
         try:
             create_game(site_url, admin_secret, payload)
             existing.add(gog_site_slug)
             gog_new += 1
-            print(
-                f"  ✅ [GOG] {payload['title']} → {payload['download_url']}"
-            )
+            print(f"  ✅ [GOG] {payload['title']} → {payload['download_url']}")
         except RuntimeError as e:
             err = str(e)
-            if (
-                "409" in err
-                or "exists" in err.lower()
-                or "duplicate" in err.lower()
-            ):
+            if "409" in err or "exists" in err.lower() or "duplicate" in err.lower():
                 existing.add(gog_site_slug)
                 print(f"  ⏭  {gog_site_slug} — already on site")
             else:
@@ -955,9 +925,7 @@ def run_cycle(args) -> int:
             and f"gog-{text(gg.get('slug'))}" not in existing
         )
         if missing == 0:
-            print(
-                "[gog] all games imported — waiting for new GOG releases"
-            )
+            print("[gog] all games imported — waiting for new GOG releases")
 
     # 4) Status -----------------------------------------------------------
     STATUS.update(
@@ -980,56 +948,21 @@ def run_cycle(args) -> int:
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--interval",
-        type=float,
-        default=env_float("FITGIRL_IMPORT_INTERVAL", 3600),
-    )
-    p.add_argument(
-        "--delay",
-        type=float,
-        default=env_float("FITGIRL_IMPORT_DELAY", 1.0),
-    )
-    p.add_argument(
-        "--fitgirl-limit",
-        type=int,
-        default=env_int("FITGIRL_IMPORT_LIMIT", 5),
-    )
-    p.add_argument(
-        "--gog-limit",
-        type=int,
-        default=env_int("GOG_IMPORT_LIMIT", 1),
-    )
-    p.add_argument(
-        "--once",
-        action="store_true",
-        default=env_bool("FITGIRL_IMPORT_ONCE"),
-    )
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=env_bool("FITGIRL_IMPORT_DRY_RUN"),
-    )
-    p.add_argument(
-        "--health-port", type=int, default=env_int("HEALTH_PORT", 8080)
-    )
-    p.add_argument(
-        "--health-host", default=env("HEALTH_HOST", "0.0.0.0")
-    )
+    p.add_argument("--interval", type=float, default=env_float("FITGIRL_IMPORT_INTERVAL", 3600))
+    p.add_argument("--delay", type=float, default=env_float("FITGIRL_IMPORT_DELAY", 1.0))
+    p.add_argument("--fitgirl-limit", type=int, default=env_int("FITGIRL_IMPORT_LIMIT", 5))
+    p.add_argument("--gog-limit", type=int, default=env_int("GOG_IMPORT_LIMIT", 1))
+    p.add_argument("--once", action="store_true", default=env_bool("FITGIRL_IMPORT_ONCE"))
+    p.add_argument("--dry-run", action="store_true", default=env_bool("FITGIRL_IMPORT_DRY_RUN"))
+    p.add_argument("--health-port", type=int, default=env_int("HEALTH_PORT", 8080))
+    p.add_argument("--health-host", default=env("HEALTH_HOST", "0.0.0.0"))
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    if (
-        args.interval < 1
-        or args.delay < 0
-        or args.fitgirl_limit < 1
-        or args.gog_limit < 1
-    ):
-        raise RuntimeError(
-            "interval & limits must be positive; delay cannot be negative"
-        )
+    if args.interval < 1 or args.delay < 0 or args.fitgirl_limit < 1 or args.gog_limit < 1:
+        raise RuntimeError("interval & limits must be positive; delay cannot be negative")
 
     start_health_server(args.health_host, args.health_port)
 
