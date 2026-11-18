@@ -2,14 +2,13 @@
 """Import FitGirl and GOG releases into Repack X via the admin API.
 
 Every 1 hour:
-  1. FitGirl: Check /latest?page=1 → add new releases (FitGirl data only, NO RAWG/GOG).
-     Title: "[Game Name] (Fitgirl Repack)"  Slug: "{slug}" (normal, no prefix)
+  1. FitGirl: Check /latest?page=1 → add new releases (FitGirl data only).
+     Title: "[Game Name] (Fitgirl Repack)"  Slug: "{slug}" (normal)
   2. GOG: Pick games from GOG scrape /api/all-games → enrich with RAWG
      (description/screenshots) + GOG Catalog API (genres/tags/cover) +
      GOG official API (system requirements) → add.
      Title: "[Game Name] (GOG Repack)"  Slug: "gog-{slug}"
-  3. If GOG game already on site as FitGirl → rename FitGirl title to
-     "[Game Name] (Fitgirl Repack)" and add GOG entry anyway.
+  3. GOG games are added even if FitGirl already has the same game (no rename).
   4. When GOG backlog is complete, only new GOG games are checked.
 
 Download URLs:
@@ -72,7 +71,7 @@ SKIP_RE = re.compile(
     r"(?:upcoming[- ]repacks?|updates?[- ]digest|digest[- ]updates?)", re.I
 )
 
-_UA = "Repack-X-Importer/5.0"
+_UA = "Repack-X-Importer/6.0"
 
 
 # ── Env helpers ───────────────────────────────────────────────────────────
@@ -250,10 +249,6 @@ def post_json(url, payload, headers=None, **kw):
     return _request_json(url, method="POST", payload=payload, headers=headers, **kw)
 
 
-def patch_json(url, payload, headers=None, **kw):
-    return _request_json(url, method="PATCH", payload=payload, headers=headers, **kw)
-
-
 # ── Data helpers ──────────────────────────────────────────────────────────
 
 def text(v) -> str:
@@ -318,25 +313,14 @@ def clean_html(raw: str) -> str:
 def clean_game_title(title: str) -> str:
     """Clean game title: >observer_ → Observer, Call of Duty® → Call of Duty."""
     t = title.strip()
-    # Remove trademark/copyright symbols everywhere
     t = re.sub(r"[™®©]", "", t)
-    # Remove leading special characters like >, <, !, ~
     t = re.sub(r"^[><!~\s]+", "", t)
-    # Remove trailing underscores, tildes, spaces
     t = re.sub(r"[_~\s]+$", "", t)
-    # Replace remaining underscores with spaces
     t = t.replace("_", " ")
-    # Collapse whitespace
     t = re.sub(r"\s+", " ", t).strip()
-    # Capitalize first letter
     if t and t[0].islower():
         t = t[0].upper() + t[1:]
     return t
-
-
-def normalize_slug_for_match(slug: str) -> str:
-    """GOG slug (underscores) → hyphen format for matching FitGirl."""
-    return slug.replace("_", "-").lower().strip("-")
 
 
 # ── FitGirl helpers ───────────────────────────────────────────────────────
@@ -472,8 +456,7 @@ def get_gog_catalog_info(
             headers = {"X-API-Key": gog_scrape_key} if gog_scrape_key else {}
             data = get_json(
                 f"{gog_scrape_base}/api/catalog?{q}",
-                headers=headers,
-                retries=2,
+                headers=headers, retries=2,
             )
             STATUS.bump("gog_api_calls")
             results = data.get("results", []) if isinstance(data, dict) else []
@@ -576,27 +559,6 @@ def create_game(site_url: str, secret: str, payload: dict) -> Any:
     }
     url = f"{site_url}/api/games/admin?secret={urllib.parse.quote(secret)}"
     return post_json(url, full_payload, headers, timeout=60, retries=1)
-
-
-def get_site_game_by_slug(site_url: str, slug: str) -> dict | None:
-    try:
-        data = get_json(
-            f"{site_url}/api/games/{urllib.parse.quote(slug, safe='')}",
-            retries=1,
-        )
-        if isinstance(data, dict):
-            return data.get("game", data)
-    except RuntimeError:
-        pass
-    return None
-
-
-def rename_game_title(
-    site_url: str, secret: str, game_id: str, new_title: str
-) -> None:
-    url = f"{site_url}/api/games/admin/{game_id}"
-    headers = {"x-admin-secret": secret, "Authorization": f"Bearer {secret}"}
-    patch_json(url, {"title": new_title}, headers=headers, timeout=30, retries=1)
 
 
 # ── Payload builders ─────────────────────────────────────────────────────
@@ -748,8 +710,7 @@ def run_cycle(args) -> int:
         slug = text(summary.get("slug"))
         if not slug:
             continue
-        # Check plain slug AND old fg- prefixed slug for duplicates
-        if slug in existing or f"fg-{slug}" in existing:
+        if slug in existing:
             continue
 
         title = clean_game_title(text(summary.get("title"))) or slug
@@ -766,7 +727,7 @@ def run_cycle(args) -> int:
         if not isinstance(detail, dict) or fg_should_skip(detail):
             continue
         exact_slug = text(detail.get("slug") or slug)
-        if exact_slug in existing or f"fg-{exact_slug}" in existing:
+        if exact_slug in existing:
             continue
         if not fg_has_downloads(detail):
             print(f"  ⏭  {exact_slug} — no download links")
@@ -802,7 +763,7 @@ def run_cycle(args) -> int:
     #    Title: "[Name] (GOG Repack)"  Slug: "gog-{slug}"
     #    Cover: coverVertical from GOG Catalog API
     #    Categories: genres + tags from GOG Catalog API ONLY
-    #    If already on site as FitGirl → rename + add GOG
+    #    No rename of FitGirl entries.
     # ═══════════════════════════════════════════════════════════════════
     print(f"\n── GOG: importing from all-games (limit: {args.gog_limit}) ──")
     try:
@@ -828,27 +789,6 @@ def run_cycle(args) -> int:
         gog_site_slug = f"gog-{gog_slug}"
         if gog_site_slug in existing:
             continue
-
-        # Check if already on site as FitGirl (normalized slug match)
-        normalized = normalize_slug_for_match(gog_slug)
-        needs_rename = False
-        fg_game_id = None
-        fg_site_slug = ""
-
-        for check in [normalized, f"fg-{normalized}"]:
-            if check in existing:
-                needs_rename = True
-                fg_site_slug = check
-                fg_game = get_site_game_by_slug(site_url, check)
-                if fg_game:
-                    fg_game_id = fg_game.get("id")
-                break
-
-        if needs_rename:
-            print(
-                f"\n  🔄 [GOG] {gog_title} — already on site as "
-                f"FitGirl ({fg_site_slug})"
-            )
 
         print(f"\n  ⬇  [GOG] {gog_title} (id={gog_id}, slug={gog_site_slug})")
 
@@ -877,32 +817,11 @@ def run_cycle(args) -> int:
                 f"shots={len(payload['screenshot_urls'])}  "
                 f"cats={payload['categories']}"
             )
-            if needs_rename:
-                print(
-                    f"  🔍 [dry-run] would rename: {fg_site_slug} → "
-                    f"'{gog_title} (Fitgirl Repack)'"
-                )
             gog_new += 1
             existing.add(gog_site_slug)
             continue
 
-        # Rename existing FitGirl entry
-        if needs_rename and fg_game_id:
-            try:
-                rename_game_title(
-                    site_url,
-                    admin_secret,
-                    fg_game_id,
-                    f"{gog_title} (Fitgirl Repack)",
-                )
-                print(
-                    f"  🔄 renamed: {fg_site_slug} → "
-                    f"'{gog_title} (Fitgirl Repack)'"
-                )
-            except RuntimeError as e:
-                print(f"  ⚠  rename failed (continuing with GOG add): {e}")
-
-        # Create GOG game
+        # Create GOG game (no rename of FitGirl entries)
         try:
             create_game(site_url, admin_secret, payload)
             existing.add(gog_site_slug)
