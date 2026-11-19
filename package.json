@@ -1,0 +1,19 @@
+{
+  "name": "repack-x-index-migrator",
+  "version": "1.0.0",
+  "description": "Standalone Railway worker to transfer Repack X game index metadata from Supabase & Koyeb PostgreSQL into a Railway Index PostgreSQL database.",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "transfer-index": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5",
+    "pg": "^8.23.1"
+  }
+}
