@@ -87,7 +87,9 @@ function resolveTargetCandidates() {
   }
 
   if (configs.length === 0) {
-    throw new Error("No valid target PostgreSQL URL or PG* variables found.");
+    throw new Error(
+      "No valid target PostgreSQL URL or PG* variables found. Set INDEX_DATABASE_URL or DATABASE_PUBLIC_URL."
+    );
   }
   return configs;
 }
@@ -96,29 +98,36 @@ async function createConnectedTargetPool() {
   const candidates = resolveTargetCandidates();
   let lastErr = null;
 
-  for (const cfg of candidates) {
-    log(`Connecting to target DB via ${cfg.label}...`);
-    let pool = new Pool(cfg.poolConfig);
-    try {
-      await pool.query("SELECT 1");
-      log(`Connected to target DB (${cfg.label}).`);
-      return pool;
-    } catch (err) {
-      lastErr = err;
-      const msg = String(err?.message || "").toLowerCase();
-      if (msg.includes("does not support ssl") && cfg.poolConfig.ssl !== false) {
-        await pool.end().catch(() => {});
-        pool = new Pool({ ...cfg.poolConfig, ssl: false });
-        try {
-          await pool.query("SELECT 1");
-          log(`Connected to target DB without SSL (${cfg.label}).`);
-          return pool;
-        } catch (retryErr) {
-          lastErr = retryErr;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    for (const cfg of candidates) {
+      log(`[attempt ${attempt}/5] Connecting to target DB via ${cfg.label}...`);
+      let pool = new Pool(cfg.poolConfig);
+      try {
+        await pool.query("SELECT 1");
+        log(`Connected to target DB (${cfg.label}).`);
+        return pool;
+      } catch (err) {
+        lastErr = err;
+        const msg = String(err?.message || "").toLowerCase();
+        if (msg.includes("does not support ssl") && cfg.poolConfig.ssl !== false) {
+          await pool.end().catch(() => {});
+          pool = new Pool({ ...cfg.poolConfig, ssl: false });
+          try {
+            await pool.query("SELECT 1");
+            log(`Connected to target DB without SSL (${cfg.label}).`);
+            return pool;
+          } catch (retryErr) {
+            lastErr = retryErr;
+          }
         }
+        log(`Attempt ${attempt} failed (${cfg.label}): ${lastErr.message}`);
+        await pool.end().catch(() => {});
       }
-      log(`Target connection attempt failed (${cfg.label}): ${lastErr.message}`);
-      await pool.end().catch(() => {});
+    }
+
+    if (attempt < 5) {
+      log("Waiting 3s before retrying database connection...");
+      await new Promise((r) => setTimeout(r, 3000));
     }
   }
 
