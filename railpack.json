@@ -1,18 +1,18 @@
 {
   "$schema": "https://schema.railpack.com",
   "packages": {
-    "python": "3.12",
+    "python": "3.11",
     "node": "22"
   },
   "steps": {
-    "install": {
+    "build": {
       "commands": [
-        "if [ -f requirements.txt ]; then pip install -r requirements.txt; fi",
-        "npm install"
+        "...",
+        "npm install --omit=dev"
+      ],
+      "deployOutputs": [
+        "node_modules"
       ]
     }
-  },
-  "deploy": {
-    "startCommand": "node index.js"
   }
 }
