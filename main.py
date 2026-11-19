@@ -588,7 +588,6 @@ def build_fitgirl_payload(
     cover = text(detail.get("cover"))
     shots = image_urls(detail.get("screenshots"))
 
-    size_orig = text(detail.get("originalSize")) or "Not Found"
     size_repack = text(detail.get("repackSize")) or "Not Found"
     size_repack = (
         re.sub(r"\s*\[Selective Download\]\s*$", "", size_repack, flags=re.I).strip()
@@ -600,7 +599,6 @@ def build_fitgirl_payload(
         "slug": slug,
         "download_url": f"{download_base}/fg-{slug}",
         "repacker": "Fitgirl",
-        "size_original": size_orig,
         "size_repack": size_repack,
         "categories": categories,
         "description": desc,
@@ -640,7 +638,6 @@ def build_gog_payload(
         "slug": f"gog-{slug}",
         "download_url": f"{download_base}/gog-{gog_id}",
         "repacker": "GOG",
-        "size_original": "Not Found",
         "size_repack": "Not Found",
         "categories": categories,
         "description": rawg.get("description", "") or "Not Found",
