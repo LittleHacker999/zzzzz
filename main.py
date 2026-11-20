@@ -9,7 +9,7 @@ Every 1 hour:
      GOG official API (system requirements) → add.
      Title: "[Game Name] (GOG Repack)"  Slug: "gog-{slug}"
   3. GOG games are added even if FitGirl already has the same game (no rename).
-  4. When GOG backlog is complete, only new GOG games are checked.
+  4. Duplicate check: /api/games/all-slugs lists ALL slugs on site.
 
 Download URLs:
   FitGirl: https://repack-x-database.vercel.app/fg-{slug}
@@ -71,7 +71,7 @@ SKIP_RE = re.compile(
     r"(?:upcoming[- ]repacks?|updates?[- ]digest|digest[- ]updates?)", re.I
 )
 
-_UA = "Repack-X-Importer/6.0"
+_UA = "Repack-X-Importer/7.0"
 
 
 # ── Env helpers ───────────────────────────────────────────────────────────
@@ -308,8 +308,6 @@ def clean_html(raw: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
-# ── Title cleaning ────────────────────────────────────────────────────────
-
 def clean_game_title(title: str) -> str:
     """Clean game title: >observer_ → Observer, Call of Duty® → Call of Duty."""
     t = title.strip()
@@ -424,16 +422,14 @@ def rawg_enrich(title: str, rawg_base: str, rawg_key: str) -> dict:
     return result
 
 
-# ── GOG Catalog API (genres + tags + coverVertical for GOG games) ───────
+# ── GOG Catalog API (genres + tags + coverVertical) ──────────────────────
 
 def get_gog_catalog_info(
     title: str, gog_scrape_base: str, gog_scrape_key: str
 ) -> dict:
-    """Get coverVertical, genres, tags from GOG Catalog API.
-    Categories come ONLY from here (not RAWG)."""
+    """Get coverVertical, genres, tags from GOG Catalog API."""
     result = {"cover_vertical": "", "genres": [], "tags": []}
 
-    # Primary: direct GOG Catalog API
     try:
         q = urllib.parse.urlencode({"query": title, "limit": 1})
         data = get_json(f"{GOG_CATALOG_API}?{q}", retries=2)
@@ -449,7 +445,6 @@ def get_gog_catalog_info(
     except RuntimeError as e:
         print(f"  ⚠  GOG Catalog API failed: {e}")
 
-    # Fallback: GOG scrape API for cover only
     if not result["cover_vertical"]:
         try:
             q = urllib.parse.urlencode({"q": title, "limit": 1})
@@ -525,11 +520,22 @@ def gog_all_games(base: str, key: str) -> list[dict]:
     return data.get("games", []) if isinstance(data, dict) else []
 
 
-# ── Repack X API ─────────────────────────────────────────────────────────
+# ── Repack X API — slug checking via /api/games/all-slugs ────────────────
 
 def fetch_existing_slugs(site_url: str) -> set[str]:
-    data = get_json(f"{site_url}/api/games/all-slugs")
+    """Fetch ALL game slugs currently on the site.
+
+    Used for duplicate detection. Since the new database allows duplicate
+    slugs between FitGirl and GOG entries, we check the EXACT slug string:
+      - FitGirl: "grand-theft-auto-v"
+      - GOG:     "gog-grand_theft_auto_v"
+    """
+    url = f"{site_url}/api/games/all-slugs"
+    print(f"[slugs] fetching {url}")
+    data = get_json(url, retries=3)
     slugs = set()
+
+    # Handle every possible response format
     items = []
     if isinstance(data, list):
         items = data
@@ -538,16 +544,25 @@ def fetch_existing_slugs(site_url: str) -> set[str]:
             if isinstance(data.get(k), list):
                 items = data[k]
                 break
+        else:
+            # Maybe the dict itself maps slug -> something
+            for k, v in data.items():
+                if isinstance(v, str) and k != "count" and k != "total":
+                    slugs.add(v.strip())
+                elif isinstance(v, dict) and v.get("slug"):
+                    slugs.add(text(v.get("slug")))
+            return slugs
+
     for item in items:
-        s = (
-            item.strip()
-            if isinstance(item, str)
-            else text(item.get("slug"))
-            if isinstance(item, dict)
-            else ""
-        )
+        if isinstance(item, str):
+            s = item.strip()
+        elif isinstance(item, dict):
+            s = text(item.get("slug"))
+        else:
+            s = ""
         if s:
             slugs.add(s)
+
     return slugs
 
 
@@ -588,6 +603,7 @@ def build_fitgirl_payload(
     cover = text(detail.get("cover"))
     shots = image_urls(detail.get("screenshots"))
 
+    size_orig = text(detail.get("originalSize")) or "Not Found"
     size_repack = text(detail.get("repackSize")) or "Not Found"
     size_repack = (
         re.sub(r"\s*\[Selective Download\]\s*$", "", size_repack, flags=re.I).strip()
@@ -599,6 +615,7 @@ def build_fitgirl_payload(
         "slug": slug,
         "download_url": f"{download_base}/fg-{slug}",
         "repacker": "Fitgirl",
+        "size_original": size_orig,
         "size_repack": size_repack,
         "categories": categories,
         "description": desc,
@@ -625,7 +642,6 @@ def build_gog_payload(
     title = clean_game_title(text(gog_game.get("title")))
     slug = text(gog_game.get("slug"))
 
-    # Categories ONLY from GOG Catalog API (genres + tags)
     categories = unique_strings(
         [
             *catalog_info.get("genres", []),
@@ -638,6 +654,7 @@ def build_gog_payload(
         "slug": f"gog-{slug}",
         "download_url": f"{download_base}/gog-{gog_id}",
         "repacker": "GOG",
+        "size_original": "Not Found",
         "size_repack": "Not Found",
         "categories": categories,
         "description": rawg.get("description", "") or "Not Found",
@@ -677,9 +694,20 @@ def run_cycle(args) -> int:
     print(f"CYCLE START  {datetime.now(timezone.utc).isoformat()}")
     print("=" * 60)
 
-    # 1) Existing slugs ---------------------------------------------------
-    existing = fetch_existing_slugs(site_url)
-    print(f"[site]  {len(existing)} existing slug(s)")
+    # 1) Fetch ALL existing slugs from site (dedup source of truth) -------
+    existing_slugs = fetch_existing_slugs(site_url)
+    fg_existing = {s for s in existing_slugs if not s.startswith("gog-")}
+    gog_existing = {s for s in existing_slugs if s.startswith("gog-")}
+    print(
+        f"[slugs] {len(existing_slugs)} total | "
+        f"{len(fg_existing)} fitgirl | {len(gog_existing)} gog"
+    )
+    if fg_existing:
+        sample = sorted(fg_existing)[:5]
+        print(f"[slugs] sample fitgirl slugs: {sample}")
+    if gog_existing:
+        sample = sorted(gog_existing)[:5]
+        print(f"[slugs] sample gog slugs: {sample}")
 
     fitgirl_new = 0
     gog_new = 0
@@ -687,7 +715,8 @@ def run_cycle(args) -> int:
 
     # ═══════════════════════════════════════════════════════════════════
     # 2) FITGIRL — page 1 only (NO RAWG / NO GOG)
-    #    Title: "[Name] (Fitgirl Repack)"  Slug: plain (no fg- prefix)
+    #    Title: "[Name] (Fitgirl Repack)"  Slug: plain (no prefix)
+    #    Dedup: check exact slug against all-slugs from site
     # ═══════════════════════════════════════════════════════════════════
     print("\n── FITGIRL: checking page 1 for new releases ──")
     try:
@@ -707,7 +736,10 @@ def run_cycle(args) -> int:
         slug = text(summary.get("slug"))
         if not slug:
             continue
-        if slug in existing:
+
+        # Dedup: exact slug match against all-slugs from site
+        if slug in existing_slugs:
+            print(f"  ✓  [FITGIRL] {slug} — already on site, skip")
             continue
 
         title = clean_game_title(text(summary.get("title"))) or slug
@@ -724,7 +756,8 @@ def run_cycle(args) -> int:
         if not isinstance(detail, dict) or fg_should_skip(detail):
             continue
         exact_slug = text(detail.get("slug") or slug)
-        if exact_slug in existing:
+        if exact_slug in existing_slugs:
+            print(f"  ✓  [FITGIRL] {exact_slug} — already on site (exact slug), skip")
             continue
         if not fg_has_downloads(detail):
             print(f"  ⏭  {exact_slug} — no download links")
@@ -738,18 +771,18 @@ def run_cycle(args) -> int:
                 f"| dl={payload['download_url']}"
             )
             fitgirl_new += 1
-            existing.add(exact_slug)
+            existing_slugs.add(exact_slug)
             continue
 
         try:
             create_game(site_url, admin_secret, payload)
-            existing.add(exact_slug)
+            existing_slugs.add(exact_slug)
             fitgirl_new += 1
             print(f"  ✅ [FITGIRL] {payload['title']} → {payload['download_url']}")
         except RuntimeError as e:
             err = str(e)
             if "409" in err or "exists" in err.lower() or "duplicate" in err.lower():
-                existing.add(exact_slug)
+                existing_slugs.add(exact_slug)
                 print(f"  ⏭  {exact_slug} — already on site")
             else:
                 print(f"  ⚠  create failed: {e}")
@@ -760,6 +793,7 @@ def run_cycle(args) -> int:
     #    Title: "[Name] (GOG Repack)"  Slug: "gog-{slug}"
     #    Cover: coverVertical from GOG Catalog API
     #    Categories: genres + tags from GOG Catalog API ONLY
+    #    Dedup: check exact "gog-{slug}" against all-slugs from site
     #    No rename of FitGirl entries.
     # ═══════════════════════════════════════════════════════════════════
     print(f"\n── GOG: importing from all-games (limit: {args.gog_limit}) ──")
@@ -782,9 +816,9 @@ def run_cycle(args) -> int:
         if not gog_slug or not gog_id:
             continue
 
-        # Check if already added as GOG
+        # Dedup: exact "gog-{slug}" match against all-slugs from site
         gog_site_slug = f"gog-{gog_slug}"
-        if gog_site_slug in existing:
+        if gog_site_slug in existing_slugs:
             continue
 
         print(f"\n  ⬇  [GOG] {gog_title} (id={gog_id}, slug={gog_site_slug})")
@@ -815,33 +849,39 @@ def run_cycle(args) -> int:
                 f"cats={payload['categories']}"
             )
             gog_new += 1
-            existing.add(gog_site_slug)
+            existing_slugs.add(gog_site_slug)
             continue
 
         # Create GOG game (no rename of FitGirl entries)
         try:
             create_game(site_url, admin_secret, payload)
-            existing.add(gog_site_slug)
+            existing_slugs.add(gog_site_slug)
             gog_new += 1
             print(f"  ✅ [GOG] {payload['title']} → {payload['download_url']}")
         except RuntimeError as e:
             err = str(e)
             if "409" in err or "exists" in err.lower() or "duplicate" in err.lower():
-                existing.add(gog_site_slug)
+                existing_slugs.add(gog_site_slug)
                 print(f"  ⏭  {gog_site_slug} — already on site")
             else:
                 print(f"  ⚠  create failed: {e}")
         time.sleep(delay)
 
-    if gog_new == 0 and gog_list:
-        missing = sum(
+    # Check GOG backlog status
+    if gog_list:
+        gog_pending = sum(
             1
             for gg in gog_list
             if text(gg.get("slug"))
-            and f"gog-{text(gg.get('slug'))}" not in existing
+            and f"gog-{text(gg.get('slug'))}" not in existing_slugs
         )
-        if missing == 0:
-            print("[gog] all games imported — waiting for new GOG releases")
+        gog_total = sum(1 for gg in gog_list if text(gg.get("slug")))
+        print(
+            f"[gog] backlog: {gog_total - gog_pending}/{gog_total} imported, "
+            f"{gog_pending} remaining"
+        )
+        if gog_pending == 0:
+            print("[gog] all games imported — will only check for new GOG releases")
 
     # 4) Status -----------------------------------------------------------
     STATUS.update(
@@ -850,12 +890,12 @@ def run_cycle(args) -> int:
         last_cycle_result=f"FitGirl: {fitgirl_new} | GOG: {gog_new}",
         total_fitgirl=STATUS.total_fitgirl + fitgirl_new,
         total_gog=STATUS.total_gog + gog_new,
-        total_existing=len(existing),
+        total_existing=len(existing_slugs),
         last_error=None,
     )
     print(
         f"\nCYCLE END — FitGirl: {fitgirl_new} new | GOG: {gog_new} new | "
-        f"total: {len(existing)}"
+        f"total on site: {len(existing_slugs)}"
     )
     return fitgirl_new + gog_new
 
