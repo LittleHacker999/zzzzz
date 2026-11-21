@@ -34,6 +34,16 @@ function isInternalHost(host) {
   );
 }
 
+function isSslHandshakeError(err) {
+  const msg = String(err?.message || "").toLowerCase();
+  return (
+    msg.includes("does not support ssl") ||
+    msg.includes("econnreset") ||
+    msg.includes("connection terminated") ||
+    (msg.includes("no pg_hba.conf entry") && msg.includes("ssl off"))
+  );
+}
+
 function resolveTargetCandidates() {
   const configs = [];
   const urls = [
@@ -59,16 +69,11 @@ function resolveTargetCandidates() {
     });
   }
 
-  const host = String(
-    process.env.PGHOST ||
-      process.env.RAILWAY_PRIVATE_DOMAIN ||
-      process.env.RAILWAY_TCP_PROXY_DOMAIN ||
-      ""
-  ).trim();
+  const host = String(process.env.PGHOST || "").trim();
   const user = String(process.env.PGUSER || process.env.POSTGRES_USER || "postgres").trim();
   const password = String(process.env.PGPASSWORD || process.env.POSTGRES_PASSWORD || "").trim();
   const database = String(process.env.PGDATABASE || process.env.POSTGRES_DB || "railway").trim();
-  const port = Number(process.env.PGPORT || process.env.RAILWAY_TCP_PROXY_PORT || 5432) || 5432;
+  const port = Number(process.env.PGPORT || 5432) || 5432;
 
   if (host && user && database) {
     configs.push({
@@ -108,8 +113,7 @@ async function createConnectedTargetPool() {
         return pool;
       } catch (err) {
         lastErr = err;
-        const msg = String(err?.message || "").toLowerCase();
-        if (msg.includes("does not support ssl") && cfg.poolConfig.ssl !== false) {
+        if (isSslHandshakeError(err) && cfg.poolConfig.ssl !== false) {
           await pool.end().catch(() => {});
           pool = new Pool({ ...cfg.poolConfig, ssl: false });
           try {
@@ -173,7 +177,7 @@ function normalizeScreenshotCount(row) {
   return 0;
 }
 
-function toIndexRecord(row, sourceDb) {
+function toIndexRecord(row) {
   const hasDesc =
     typeof row?.has_description === "boolean"
       ? row.has_description
@@ -193,43 +197,9 @@ function toIndexRecord(row, sourceDb) {
     downloads_count: Number(row.downloads_count) || 0,
     has_description: Boolean(hasDesc),
     screenshot_count: normalizeScreenshotCount(row),
-    source_db: sourceDb,
+    source_db: "supabase",
     created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
   };
-}
-
-async function fetchKoyebGames() {
-  const koyebUrl = String(process.env.KOYEB_DATABASE_URL || "").trim();
-  if (!koyebUrl) {
-    log("KOYEB_DATABASE_URL not set — skipping Koyeb.");
-    return [];
-  }
-
-  log("Fetching games from Koyeb PostgreSQL...");
-  const parsed = new URL(koyebUrl);
-  parsed.searchParams.delete("sslmode");
-  const pool = new Pool({
-    connectionString: parsed.toString(),
-    ssl: { rejectUnauthorized: false },
-    max: 2,
-    connectionTimeoutMillis: 12000,
-  });
-
-  try {
-    const { rows } = await pool.query(`
-      SELECT
-        id, title, slug, categories, size_repack, cover_url, repacker,
-        featured, trending, is_published, downloads_count, created_at,
-        (description IS NOT NULL AND btrim(description) <> '' AND lower(btrim(description)) NOT IN ('not found','not available','n/a','none')) AS has_description,
-        COALESCE(array_length(screenshots, 1), 0)::int AS screenshot_count
-      FROM games
-      ORDER BY created_at DESC, id ASC
-    `);
-    log(`Fetched ${rows.length} games from Koyeb.`);
-    return rows.map((r) => toIndexRecord(r, "postgres"));
-  } finally {
-    await pool.end().catch(() => {});
-  }
 }
 
 async function fetchSupabaseGames() {
@@ -238,7 +208,7 @@ async function fetchSupabaseGames() {
   ).trim();
 
   if (directUrl) {
-    log("Fetching legacy games from Supabase via direct SQL...");
+    log("Fetching games from Supabase via direct SQL...");
     const parsed = parseValidPgUrl(directUrl);
     if (parsed) {
       parsed.searchParams.delete("sslmode");
@@ -259,7 +229,7 @@ async function fetchSupabaseGames() {
           ORDER BY created_at DESC, id ASC
         `);
         log(`Fetched ${rows.length} games from Supabase SQL.`);
-        return rows.map((r) => toIndexRecord(r, "supabase"));
+        return rows.map(toIndexRecord);
       } catch (err) {
         log(`Direct Supabase SQL failed (${err.message}), falling back to REST API...`);
       } finally {
@@ -277,11 +247,12 @@ async function fetchSupabaseGames() {
   ).trim();
 
   if (!supaUrl || !supaKey) {
-    log("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set — skipping Supabase.");
-    return [];
+    throw new Error(
+      "Missing Supabase source credentials. Set POSTGRES_URL_NON_POOLING or SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY."
+    );
   }
 
-  log("Fetching legacy games from Supabase REST API...");
+  log("Fetching games from Supabase REST API...");
   const supabase = createClient(supaUrl, supaKey, { auth: { persistSession: false } });
   const allRows = [];
   let from = 0;
@@ -299,7 +270,7 @@ async function fetchSupabaseGames() {
 
     if (error) throw new Error(`Supabase fetch failed: ${error.message}`);
     const batch = Array.isArray(data) ? data : [];
-    allRows.push(...batch.map((r) => toIndexRecord(r, "supabase")));
+    allRows.push(...batch.map(toIndexRecord));
     log(`Supabase REST fetched ${allRows.length} rows...`);
     if (batch.length < SUPABASE_PAGE_SIZE) break;
     from += SUPABASE_PAGE_SIZE;
@@ -323,7 +294,7 @@ const SCHEMA_SQL = `
     downloads_count integer NOT NULL DEFAULT 0,
     has_description boolean NOT NULL DEFAULT false,
     screenshot_count integer NOT NULL DEFAULT 0,
-    source_db text NOT NULL DEFAULT 'postgres',
+    source_db text NOT NULL DEFAULT 'supabase',
     created_at timestamptz NOT NULL DEFAULT now()
   );
   CREATE INDEX IF NOT EXISTS games_index_created_at_idx ON games_index (created_at DESC);
@@ -335,38 +306,26 @@ const SCHEMA_SQL = `
 
 async function run() {
   const startedAt = Date.now();
-  log("Starting Repack X Index Migrator...");
+  log("Starting Repack X Index Migrator (Supabase -> Index PostgreSQL)...");
 
   const targetPool = await createConnectedTargetPool();
   await targetPool.query(SCHEMA_SQL);
   log("Verified games_index schema.");
 
-  const [pgRows, supaRows] = await Promise.all([
-    fetchKoyebGames(),
-    fetchSupabaseGames(),
-  ]);
-
+  const supaRows = await fetchSupabaseGames();
   const mergedMap = new Map();
   const seenSlugs = new Set();
 
-  for (const row of pgRows) {
-    if (!row.id || !row.slug) continue;
-    mergedMap.set(row.id, row);
-    seenSlugs.add(row.slug.toLowerCase());
-  }
-
-  let supaKept = 0;
   for (const row of supaRows) {
     if (!row.id || !row.slug) continue;
     const slugKey = row.slug.toLowerCase();
     if (mergedMap.has(row.id) || seenSlugs.has(slugKey)) continue;
     mergedMap.set(row.id, row);
     seenSlugs.add(slugKey);
-    supaKept += 1;
   }
 
   const allIndexRows = Array.from(mergedMap.values());
-  log(`Writing ${allIndexRows.length} games (Koyeb: ${pgRows.length}, Supabase: ${supaKept})...`);
+  log(`Writing ${allIndexRows.length} indexed games to target database...`);
 
   const client = await targetPool.connect();
   try {
